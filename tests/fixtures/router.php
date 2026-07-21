@@ -6,6 +6,7 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 if ($path === '/health' && $method === 'GET') {
     header('Content-Type: application/json');
+    header('X-RateLimit-Remaining: 42');
     echo json_encode(['ok' => true]);
     return;
 }

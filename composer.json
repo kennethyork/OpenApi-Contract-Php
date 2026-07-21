@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "test": [
-      "php -l bin/openapi-contract"
+      "php -l bin/openapi-contract",
+      "php -l bin/openapi-contract-native"
     ]
   }
 }

@@ -15,6 +15,15 @@
         "responses": {
           "200": {
             "description": "Health response",
+            "headers": {
+              "X-RateLimit-Remaining": {
+                "required": true,
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

@@ -203,7 +203,9 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
     printWarnings($state);
     printSummary($operations, $phaseResults, $state);
     writeReports($state, $phaseResults);
-    $GLOBALS['openapi_contract_last_run'] = runSummary($operations, $phaseResults, $state);
+    $summary = runSummary($operations, $phaseResults, $state);
+    $GLOBALS['openapi_contract_last_run'] = $summary;
+    runProAfterRunHook($state, $phaseResults, $summary);
     return $state['failures'] ? 1 : 0;
 }
 
@@ -297,7 +299,30 @@ function runProCommand(?string $action, array $options, ?callable $extension): i
     echo "  php bin/openapi-contract pro --pro-path path/to/openapi-contract-pro.php status\n\n";
     echo "The extension file should define:\n";
     echo "  openapi_contract_pro_command(string \$action, array \$options): int\n";
+    echo "\nPaid features can also hook into the same run and benchmark commands:\n";
+    echo "  openapi_contract_pro_after_run(array \$state, array \$phaseResults, array \$summary): void\n";
+    echo "  openapi_contract_pro_after_benchmark(array \$report, array \$options): void\n";
+    echo "\nTypical Pro additions: HTML/PDF audit reports, team baselines, private rule\n";
+    echo "packs, framework presets, signed PHAR builds, and priority support.\n";
     return 2;
+}
+
+function runProAfterRunHook(array $state, array $phaseResults, array $summary): void {
+    if (!function_exists('openapi_contract_pro_after_run')) return;
+    try {
+        openapi_contract_pro_after_run($state, $phaseResults, $summary);
+    } catch (Throwable $e) {
+        fwrite(STDERR, "Pro after-run hook failed: {$e->getMessage()}\n");
+    }
+}
+
+function runProAfterBenchmarkHook(array $report, array $options): void {
+    if (!function_exists('openapi_contract_pro_after_benchmark')) return;
+    try {
+        openapi_contract_pro_after_benchmark($report, $options);
+    } catch (Throwable $e) {
+        fwrite(STDERR, "Pro after-benchmark hook failed: {$e->getMessage()}\n");
+    }
 }
 
 function runInitCommand(?string $target, array $options): int {
@@ -549,6 +574,7 @@ function runBenchmarkCommand(?string $suitePath, array $options): int {
     writeBenchmarkFile($jsonPath, json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
     $markdownPath = optionString($options, 'benchmark-markdown', 'benchmark-report/summary.md');
     writeBenchmarkFile($markdownPath, benchmarkMarkdown($report));
+    runProAfterBenchmarkHook($report, $options);
 
     echo "\n================================== BENCHMARK ==================================\n";
     echo "Runtime: " . sprintf('%.3fs', $aggregate['duration']) . "\n";
@@ -611,7 +637,7 @@ function benchmarkCaseOptions(array $case, array $suite, array $globalOptions, s
     $options = [];
     foreach (($suite['defaults'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
     foreach (($case['options'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
-    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'auth', 'auth-token'] as $key) {
+    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'auth', 'auth-token', 'pro-path', 'license-key'] as $key) {
         if (array_key_exists($key, $globalOptions)) $options[$key] = $globalOptions[$key];
     }
     if (isset($globalOptions['auth-api-key'])) $options['auth-api-key'] = $globalOptions['auth-api-key'];

@@ -6,6 +6,21 @@ contract testing. It is MIT licensed and should stay useful on its own.
 The Pro edition should live outside this public repository as a private
 extension, licensed separately.
 
+## Same CLI Model
+
+Free and paid users run the same CLI:
+
+```bash
+php bin/openapi-contract run openapi.json --url http://127.0.0.1:8080
+php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
+php bin/openapi-contract replay --cache-dir .openapi-contract/cache
+```
+
+The difference is whether a private Pro extension and valid license token are
+available. Without Pro, the commands run the Community feature set. With Pro,
+the same commands can add paid reports, paid checks, paid exports, and paid
+workflow integrations.
+
 ## Product Boundary
 
 Community edition:
@@ -31,6 +46,18 @@ Pro edition:
 - signed PHAR builds
 - priority support
 
+## Paid Additions
+
+| Area | Community | Pro |
+| --- | --- | --- |
+| CLI commands | Same commands | Same commands, unlocked by extension/token |
+| Runtime checks | Built-in local checks | Private security, governance, and organization rule packs |
+| Reports | JUnit, HAR, NDJSON, VCR, Markdown benchmark summaries | HTML audit dashboard, PDF export, customer-ready evidence bundle |
+| Benchmarks | Public local corpuses | Larger private corpus, baseline history, trend/regression reports |
+| Framework workflow | Generic HTTP API testing | Laravel/PHP presets, common auth/header profiles, app-specific templates |
+| Packaging | Source checkout | Signed PHAR or single-file paid extension |
+| Support | Community/self-serve | Priority support, setup help, paid API audits |
+
 ## Extension Loading
 
 The public CLI has a small Pro extension hook. Private code can be placed in one
@@ -55,6 +82,22 @@ The extension file should define:
 function openapi_contract_pro_command(string $action, array $options): int {
     // Dispatch private Pro commands here.
     return 0;
+}
+```
+
+To add paid behavior to the same `run` and `fuzz` commands, define:
+
+```php
+function openapi_contract_pro_after_run(array $state, array $phaseResults, array $summary): void {
+    // Write paid HTML/PDF/audit reports here.
+}
+```
+
+To add paid behavior to the same `benchmark` command, define:
+
+```php
+function openapi_contract_pro_after_benchmark(array $report, array $options): void {
+    // Write paid baseline, trend, or dashboard outputs here.
 }
 ```
 

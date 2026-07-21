@@ -1,0 +1,19 @@
+{
+  "name": "kennethyork/openapi-contract-php",
+  "description": "PHP-native OpenAPI contract and fuzz testing runner.",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "bin": [
+    "bin/openapi-contract"
+  ],
+  "scripts": {
+    "test": [
+      "php -l bin/openapi-contract"
+    ]
+  }
+}

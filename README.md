@@ -61,7 +61,15 @@ php bin/openapi-contract run --config openapi-contract.json
 Run the local benchmark corpus:
 
 ```bash
+php -S 127.0.0.1:8089 tests/fixtures/router.php
 php bin/openapi-contract benchmark tests/benchmarks/local.json
+```
+
+Run the broader randomized contract corpus:
+
+```bash
+php tests/fixtures/random-openapi/generate.php
+php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
 ```
 
 ```bash

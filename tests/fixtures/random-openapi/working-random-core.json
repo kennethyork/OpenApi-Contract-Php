@@ -1,0 +1,887 @@
+{
+    "openapi": "3.0.3",
+    "info": {
+        "title": "Working Random Core Cipher 838",
+        "version": "1.0.0"
+    },
+    "servers": [
+        {
+            "url": "http://127.0.0.1:8089"
+        }
+    ],
+    "paths": {
+        "/random/status": {
+            "get": {
+                "operationId": "getRandomStatus",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": [
+                                        "status",
+                                        "code",
+                                        "active"
+                                    ],
+                                    "properties": {
+                                        "status": {
+                                            "type": "string",
+                                            "enum": [
+                                                "ok"
+                                            ]
+                                        },
+                                        "code": {
+                                            "type": "integer",
+                                            "minimum": 200,
+                                            "maximum": 299
+                                        },
+                                        "active": {
+                                            "type": "boolean"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "headers": {
+                            "X-Fixture-Count": {
+                                "required": true,
+                                "schema": {
+                                    "type": "integer",
+                                    "minimum": 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/search": {
+            "get": {
+                "operationId": "searchRandomCatalog",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "required": true,
+                        "example": "atlas",
+                        "schema": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 20
+                        }
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": true,
+                        "example": 2,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50
+                        }
+                    },
+                    {
+                        "name": "tags",
+                        "in": "query",
+                        "required": false,
+                        "style": "pipeDelimited",
+                        "explode": false,
+                        "example": [
+                            "outerwear",
+                            "featured"
+                        ],
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/SearchResult"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Invalid query",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/products/{productId}": {
+            "parameters": [
+                {
+                    "name": "productId",
+                    "in": "path",
+                    "required": true,
+                    "example": "prod_42",
+                    "schema": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            ],
+            "get": {
+                "operationId": "getRandomProduct",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Product"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/orders": {
+            "post": {
+                "operationId": "createRandomOrder",
+                "tags": [
+                    "random",
+                    "working",
+                    "stateful"
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/OrderInput"
+                            },
+                            "example": {
+                                "customerId": "cust_123",
+                                "amount": 125,
+                                "currency": "USD",
+                                "items": [
+                                    {
+                                        "sku": "sku_1",
+                                        "quantity": 2
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "headers": {
+                            "Location": {
+                                "required": true,
+                                "schema": {
+                                    "type": "string",
+                                    "minLength": 1
+                                }
+                            }
+                        },
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Order"
+                                }
+                            }
+                        },
+                        "links": {
+                            "GetOrder": {
+                                "operationId": "getRandomOrder",
+                                "parameters": {
+                                    "orderId": "$response.body#/id"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Invalid order",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/orders/{orderId}": {
+            "parameters": [
+                {
+                    "name": "orderId",
+                    "in": "path",
+                    "required": true,
+                    "example": "order_1",
+                    "schema": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            ],
+            "get": {
+                "operationId": "getRandomOrder",
+                "tags": [
+                    "random",
+                    "working",
+                    "stateful"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Order"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "patch": {
+                "operationId": "patchRandomOrder",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/PatchOrderInput"
+                            },
+                            "example": {
+                                "status": "paid"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Order"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Invalid status",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "operationId": "deleteRandomOrder",
+                "tags": [
+                    "random",
+                    "working",
+                    "stateful"
+                ],
+                "responses": {
+                    "204": {
+                        "description": "Deleted"
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/text": {
+            "post": {
+                "operationId": "postRandomText",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "text/plain": {
+                            "schema": {
+                                "type": "string",
+                                "minLength": 1
+                            },
+                            "example": "hello"
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Text",
+                        "content": {
+                            "text/plain": {
+                                "schema": {
+                                    "type": "string",
+                                    "minLength": 1
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Empty text",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/blob": {
+            "get": {
+                "operationId": "getRandomBlob",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Binary",
+                        "content": {
+                            "application/octet-stream": {
+                                "schema": {
+                                    "type": "string",
+                                    "format": "binary"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/headers": {
+            "get": {
+                "operationId": "getRandomHeaders",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "parameters": [
+                    {
+                        "name": "X-Trace-Id",
+                        "in": "header",
+                        "required": true,
+                        "example": "trace-123",
+                        "schema": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HeaderEcho"
+                                }
+                            }
+                        },
+                        "headers": {
+                            "X-Fixture-Count": {
+                                "required": true,
+                                "schema": {
+                                    "type": "integer",
+                                    "minimum": 1
+                                }
+                            },
+                            "X-Fixture-Mode": {
+                                "required": true,
+                                "schema": {
+                                    "type": "string",
+                                    "enum": [
+                                        "pass"
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Missing header",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/polymorphic": {
+            "get": {
+                "operationId": "getRandomPolymorphic",
+                "tags": [
+                    "random",
+                    "working"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "oneOf": [
+                                        {
+                                            "$ref": "#/components/schemas/CardVariant"
+                                        },
+                                        {
+                                            "$ref": "#/components/schemas/BankVariant"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/random/secure/profile": {
+            "get": {
+                "operationId": "getRandomSecureProfile",
+                "tags": [
+                    "random",
+                    "working",
+                    "auth"
+                ],
+                "security": [
+                    {
+                        "ApiKeyAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Profile"
+                                }
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Error"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "securitySchemes": {
+            "ApiKeyAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-API-Key"
+            }
+        },
+        "schemas": {
+            "Error": {
+                "type": "object",
+                "required": [
+                    "error"
+                ],
+                "properties": {
+                    "error": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                },
+                "additionalProperties": false
+            },
+            "LineItem": {
+                "type": "object",
+                "required": [
+                    "sku",
+                    "quantity"
+                ],
+                "properties": {
+                    "sku": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 24
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10
+                    }
+                },
+                "additionalProperties": false
+            },
+            "OrderInput": {
+                "type": "object",
+                "required": [
+                    "customerId",
+                    "amount",
+                    "currency",
+                    "items"
+                ],
+                "properties": {
+                    "customerId": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 24
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": [
+                            "USD",
+                            "EUR",
+                            "GBP"
+                        ]
+                    },
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "$ref": "#/components/schemas/LineItem"
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            "OrderCore": {
+                "type": "object",
+                "required": [
+                    "customerId",
+                    "amount",
+                    "currency",
+                    "items"
+                ],
+                "properties": {
+                    "customerId": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 24
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": [
+                            "USD",
+                            "EUR",
+                            "GBP"
+                        ]
+                    },
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "$ref": "#/components/schemas/LineItem"
+                        }
+                    }
+                },
+                "additionalProperties": true
+            },
+            "Order": {
+                "allOf": [
+                    {
+                        "$ref": "#/components/schemas/OrderCore"
+                    },
+                    {
+                        "type": "object",
+                        "required": [
+                            "id",
+                            "status"
+                        ],
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "minLength": 1
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    "created",
+                                    "paid",
+                                    "shipped",
+                                    "cancelled"
+                                ]
+                            }
+                        },
+                        "additionalProperties": true
+                    }
+                ]
+            },
+            "PatchOrderInput": {
+                "type": "object",
+                "required": [
+                    "status"
+                ],
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "created",
+                            "paid",
+                            "shipped",
+                            "cancelled"
+                        ]
+                    }
+                },
+                "additionalProperties": false
+            },
+            "Product": {
+                "type": "object",
+                "required": [
+                    "id",
+                    "name",
+                    "price",
+                    "tags",
+                    "stock"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "name": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 40
+                    },
+                    "price": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10000
+                    },
+                    "tags": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "stock": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "discontinued": {
+                        "type": "boolean"
+                    }
+                },
+                "additionalProperties": false
+            },
+            "SearchResult": {
+                "type": "object",
+                "required": [
+                    "total",
+                    "results"
+                ],
+                "properties": {
+                    "total": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/Product"
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            "HeaderEcho": {
+                "type": "object",
+                "required": [
+                    "traceId",
+                    "accepted"
+                ],
+                "properties": {
+                    "traceId": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "accepted": {
+                        "type": "boolean"
+                    }
+                },
+                "additionalProperties": false
+            },
+            "CardVariant": {
+                "type": "object",
+                "required": [
+                    "type",
+                    "cardNumber",
+                    "last4"
+                ],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "card"
+                        ]
+                    },
+                    "cardNumber": {
+                        "type": "string",
+                        "minLength": 12,
+                        "maxLength": 19
+                    },
+                    "last4": {
+                        "type": "string",
+                        "minLength": 4,
+                        "maxLength": 4
+                    }
+                },
+                "additionalProperties": false
+            },
+            "BankVariant": {
+                "type": "object",
+                "required": [
+                    "type",
+                    "routingNumber"
+                ],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "bank"
+                        ]
+                    },
+                    "routingNumber": {
+                        "type": "string",
+                        "minLength": 9,
+                        "maxLength": 9
+                    }
+                },
+                "additionalProperties": false
+            },
+            "Profile": {
+                "type": "object",
+                "required": [
+                    "id",
+                    "email",
+                    "role"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "admin",
+                            "member"
+                        ]
+                    }
+                },
+                "additionalProperties": false
+            }
+        }
+    }
+}

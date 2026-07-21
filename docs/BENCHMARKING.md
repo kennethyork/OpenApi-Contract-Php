@@ -14,6 +14,13 @@ This project includes a local benchmark corpus that exercises:
 - stateful resource checks
 - replay-quality failure capture
 
+It also includes a larger generated corpus under
+`tests/fixtures/random-openapi/`. That corpus includes working specs and
+intentionally broken specs for status drift, content-type drift, response schema
+drift, missing response headers, ignored auth, negative input acceptance,
+positive input rejection, unsupported method handling, stateful availability,
+and use-after-free behavior.
+
 ## Run
 
 Start the fixture API:
@@ -28,10 +35,22 @@ Run the benchmark:
 php bin/openapi-contract benchmark tests/benchmarks/local.json
 ```
 
+Regenerate and run the broader randomized corpus:
+
+```bash
+php tests/fixtures/random-openapi/generate.php
+php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
+```
+
 Use another local port:
 
 ```bash
 php bin/openapi-contract benchmark tests/benchmarks/local.json \
+  --base-url http://127.0.0.1:8724
+```
+
+```bash
+php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json \
   --base-url http://127.0.0.1:8724
 ```
 

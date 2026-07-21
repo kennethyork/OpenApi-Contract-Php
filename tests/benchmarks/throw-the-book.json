@@ -1,0 +1,184 @@
+{
+    "name": "throw-the-book-random-openapi-corpus",
+    "base-url": "http://127.0.0.1:8089",
+    "defaults": {
+        "seed": 20260721,
+        "max-examples": 2,
+        "request-timeout": 5,
+        "report": "ndjson,junit,har,vcr",
+        "report-dir": "/tmp/openapi-contract-throw-book-reports",
+        "cache-dir": "/tmp/openapi-contract-throw-book-cache"
+    },
+    "cases": [
+        {
+            "name": "random-core-all-checks",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/working-random-core.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples,coverage,fuzzing",
+                "checks": "all",
+                "auth-api-key": "ApiKeyAuth:secret"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "random-negative-fuzzing",
+            "command": "fuzz",
+            "schema": "tests/fixtures/random-openapi/working-random-fuzz.json",
+            "url": "{base_url}",
+            "options": {
+                "mode": "all",
+                "checks": "all",
+                "max-examples": 3
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "random-stateful-clean",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/working-random-stateful.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "stateful",
+                "checks": "ensure_resource_availability,use_after_free",
+                "max-examples": 2
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "broken-undocumented-status",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-status.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples",
+                "checks": "status_code_conformance",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-content-type",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-content-type.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples",
+                "checks": "content_type_conformance",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-response-schema",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-schema.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples",
+                "checks": "response_schema_conformance",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-required-header",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-header.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples",
+                "checks": "response_headers_conformance",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-ignored-auth",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-auth.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "coverage",
+                "checks": "ignored_auth",
+                "auth-api-key": "ApiKeyAuth:secret",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-negative-rejection",
+            "command": "fuzz",
+            "schema": "tests/fixtures/random-openapi/broken-negative-rejection.json",
+            "url": "{base_url}",
+            "options": {
+                "mode": "negative",
+                "checks": "negative_data_rejection",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-positive-acceptance",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-positive-acceptance.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples",
+                "checks": "positive_data_acceptance",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-unsupported-method",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-unsupported-method.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "coverage",
+                "checks": "unsupported_method",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-resource-availability",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-stateful-availability.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "stateful",
+                "checks": "ensure_resource_availability",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        },
+        {
+            "name": "broken-use-after-free",
+            "command": "run",
+            "schema": "tests/fixtures/random-openapi/broken-use-after-free.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "stateful",
+                "checks": "ensure_resource_availability,use_after_free",
+                "max-failures": 1
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        }
+    ]
+}

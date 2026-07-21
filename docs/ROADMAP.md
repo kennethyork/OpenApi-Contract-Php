@@ -19,6 +19,7 @@ hosted services, or CI/CD coupling.
 | CLI `interactive` command | Supported | Menu-driven setup, diagnostics, run, fuzz, replay, and config refresh. |
 | CLI `init` command | Supported | Creates JSON config interactively or with `--no-interaction`. |
 | CLI `doctor` command | Supported | Checks PHP extensions, config, schema loading, base URL, operations, reports, and compatibility notes. |
+| CLI `benchmark` command | Supported | Runs JSON benchmark suites, writes JSON/Markdown evidence, and compares prior baselines. |
 | CLI `run` command | Supported | Runs the PHP implementation; can use LOCATION or config `schema-location`. |
 | CLI `fuzz` command | Supported | Runs fuzzing phase directly; supports `--max-time`, modes, seed, and max examples. |
 | CLI `replay` command | Supported | Replays saved failing cases from the crash cache. |

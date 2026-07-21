@@ -84,6 +84,10 @@ function main(array $argv): void {
         exit(runInteractiveCommand($parsed['location'], $parsed['options']));
     }
 
+    if ($command === 'benchmark') {
+        exit(runBenchmarkCommand($parsed['location'], $parsed['options']));
+    }
+
     $options = mergeConfigOptions($parsed['options']);
     if ($command === 'doctor') {
         exit(runDoctorCommand($parsed['location'], $options));
@@ -193,6 +197,7 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
     printWarnings($state);
     printSummary($operations, $phaseResults, $state);
     writeReports($state, $phaseResults);
+    $GLOBALS['openapi_contract_last_run'] = runSummary($operations, $phaseResults, $state);
     return $state['failures'] ? 1 : 0;
 }
 
@@ -200,6 +205,7 @@ function printUsage(): void {
     echo "Usage:\n";
     echo "  php bin/openapi-contract init [OPTIONS] [LOCATION]\n";
     echo "  php bin/openapi-contract interactive [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract benchmark [OPTIONS] [SUITE]\n";
     echo "  php bin/openapi-contract doctor [OPTIONS] [LOCATION]\n";
     echo "  php bin/openapi-contract run [OPTIONS] [LOCATION]\n";
     echo "  php bin/openapi-contract fuzz [OPTIONS] [LOCATION]\n";
@@ -237,6 +243,11 @@ function printUsage(): void {
     echo "  --report-ndjson-path FILE      NDJSON events output path\n";
     echo "  --report-vcr-path FILE         Request/response cassette path\n";
     echo "  --cache-dir DIRECTORY          Crash/replay cache directory\n";
+    echo "  --base-url URL                 Benchmark suite base URL placeholder\n";
+    echo "  --benchmark-output FILE        Benchmark JSON result path\n";
+    echo "  --benchmark-markdown FILE      Benchmark Markdown summary path\n";
+    echo "  --benchmark-baseline FILE      Compare benchmark result to a prior JSON result\n";
+    echo "  --fail-on-regression           Exit non-zero on unexpected benchmark failures\n";
     echo "  --seed N                       Reproducible random seed\n";
     echo "  --no-interaction               Write init defaults without prompting\n";
     echo "  --force                        Allow init to overwrite an existing config\n";
@@ -429,6 +440,230 @@ function runInteractiveCommand(?string $target, array $options): int {
 
         if (!promptYesNo('Choose another action?', false)) return $lastExitCode;
     }
+}
+
+function runBenchmarkCommand(?string $suitePath, array $options): int {
+    $suitePath = $suitePath ?: optionString($options, 'suite', 'tests/benchmarks/local.json');
+    if (!is_file($suitePath)) {
+        fwrite(STDERR, "Benchmark suite not found: {$suitePath}\n");
+        return 2;
+    }
+    $suite = json_decode((string)file_get_contents($suitePath), true);
+    if (!is_array($suite)) {
+        fwrite(STDERR, "Benchmark suite is not valid JSON: {$suitePath}\n");
+        return 2;
+    }
+
+    $started = microtime(true);
+    $baseUrl = optionString($options, 'base-url', (string)($suite['base-url'] ?? ''));
+    $cases = array_values(array_filter($suite['cases'] ?? [], 'is_array'));
+    $results = [];
+    $unexpected = 0;
+
+    echo "openapi-contract-php benchmark\n";
+    echo str_repeat("-", 30) . "\n\n";
+    echo "Suite: " . ($suite['name'] ?? basename($suitePath)) . "\n";
+    echo "Cases: " . count($cases) . "\n\n";
+
+    foreach ($cases as $case) {
+        $caseResult = runBenchmarkCase($case, $suite, $options, $baseUrl);
+        $results[] = $caseResult;
+        if (!$caseResult['matched_expectation']) $unexpected++;
+        printf(
+            " %-4s %-28s %4d cases %3d failures %.3fs\n",
+            $caseResult['matched_expectation'] ? 'OK' : 'FAIL',
+            $caseResult['name'],
+            $caseResult['cases'],
+            $caseResult['failures'],
+            $caseResult['duration']
+        );
+    }
+
+    $aggregate = aggregateBenchmarkResults($results, microtime(true) - $started);
+    $baseline = null;
+    if (isset($options['benchmark-baseline']) && is_file((string)$options['benchmark-baseline'])) {
+        $baseline = json_decode((string)file_get_contents((string)$options['benchmark-baseline']), true);
+        if (!is_array($baseline)) $baseline = null;
+    }
+    $comparison = $baseline ? compareBenchmarkResults($aggregate, $baseline['aggregate'] ?? []) : null;
+    $report = [
+        'schema_version' => 1,
+        'suite' => [
+            'name' => $suite['name'] ?? basename($suitePath),
+            'path' => $suitePath,
+            'base_url' => $baseUrl
+        ],
+        'created_at' => gmdate('c'),
+        'aggregate' => $aggregate,
+        'comparison' => $comparison,
+        'results' => $results
+    ];
+
+    $jsonPath = optionString($options, 'benchmark-output', 'benchmark-report/results.json');
+    writeBenchmarkFile($jsonPath, json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    $markdownPath = optionString($options, 'benchmark-markdown', 'benchmark-report/summary.md');
+    writeBenchmarkFile($markdownPath, benchmarkMarkdown($report));
+
+    echo "\n================================== BENCHMARK ==================================\n";
+    echo "Runtime: " . sprintf('%.3fs', $aggregate['duration']) . "\n";
+    echo "Operations: {$aggregate['operations_selected']}/{$aggregate['operations_total']}\n";
+    echo "Cases: {$aggregate['cases']}\n";
+    echo "Failures: {$aggregate['failures']}\n";
+    echo "Unexpected results: {$unexpected}\n";
+    echo "Quality score: {$aggregate['quality_score']}/100\n";
+    if ($comparison !== null) {
+        echo "Baseline delta: " . sprintf('%+.1f', $comparison['quality_score_delta']) . " score, ";
+        echo sprintf('%+d', $comparison['failure_delta']) . " failures\n";
+    }
+    echo "Benchmark JSON: {$jsonPath}\n";
+    echo "Benchmark Markdown: {$markdownPath}\n";
+
+    return ($unexpected > 0 && truthyOption($options['fail-on-regression'] ?? false)) ? 1 : 0;
+}
+
+function runBenchmarkCase(array $case, array $suite, array $globalOptions, string $baseUrl): array {
+    $name = (string)($case['name'] ?? 'case-' . substr(hash('sha256', json_encode($case)), 0, 8));
+    $command = in_array(($case['command'] ?? 'run'), ['run', 'fuzz'], true) ? (string)($case['command'] ?? 'run') : 'run';
+    $schema = benchmarkInterpolate((string)($case['schema'] ?? ''), $baseUrl);
+    $caseOptions = benchmarkCaseOptions($case, $suite, $globalOptions, $baseUrl);
+    $expectedExit = isset($case['expect_exit_code']) ? (int)$case['expect_exit_code'] : (int)($case['expected_exit_code'] ?? 0);
+    $expectedFailures = isset($case['expected_failures']) ? (int)$case['expected_failures'] : null;
+
+    $GLOBALS['openapi_contract_last_run'] = null;
+    $started = microtime(true);
+    ob_start();
+    $exitCode = runTestCommand($command, $schema, $caseOptions);
+    $output = ob_get_clean();
+    $duration = microtime(true) - $started;
+    $summary = is_array($GLOBALS['openapi_contract_last_run'] ?? null) ? $GLOBALS['openapi_contract_last_run'] : [];
+    $failures = (int)($summary['failed'] ?? ($exitCode === 0 ? 0 : 1));
+    $matched = $exitCode === $expectedExit && ($expectedFailures === null || $failures === $expectedFailures);
+
+    return [
+        'name' => $name,
+        'command' => $command,
+        'schema' => $schema,
+        'url' => $caseOptions['url'] ?? null,
+        'exit_code' => $exitCode,
+        'expected_exit_code' => $expectedExit,
+        'expected_failures' => $expectedFailures,
+        'matched_expectation' => $matched,
+        'duration' => round($duration, 6),
+        'cases' => (int)($summary['cases'] ?? 0),
+        'passed' => (int)($summary['passed'] ?? 0),
+        'failures' => $failures,
+        'skipped' => (int)($summary['skipped'] ?? 0),
+        'operations_selected' => (int)($summary['operations_selected'] ?? 0),
+        'operations_total' => (int)($summary['operations_total'] ?? 0),
+        'warnings' => $summary['warnings'] ?? [],
+        'failure_messages' => $summary['failure_messages'] ?? [],
+        'output_tail' => benchmarkOutputTail((string)$output)
+    ];
+}
+
+function benchmarkCaseOptions(array $case, array $suite, array $globalOptions, string $baseUrl): array {
+    $options = [];
+    foreach (($suite['defaults'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
+    foreach (($case['options'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
+    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'auth', 'auth-token'] as $key) {
+        if (array_key_exists($key, $globalOptions)) $options[$key] = $globalOptions[$key];
+    }
+    if (isset($globalOptions['auth-api-key'])) $options['auth-api-key'] = $globalOptions['auth-api-key'];
+    if (isset($globalOptions['header'])) $options['header'] = $globalOptions['header'];
+    if (isset($case['url'])) $options['url'] = benchmarkInterpolate((string)$case['url'], $baseUrl);
+    if (isset($globalOptions['url'])) $options['url'] = benchmarkInterpolate((string)$globalOptions['url'], $baseUrl);
+    return $options;
+}
+
+function benchmarkOptionValue($value, string $baseUrl) {
+    if (is_array($value)) return array_map(fn($item) => is_string($item) ? benchmarkInterpolate($item, $baseUrl) : $item, $value);
+    if (is_string($value)) return benchmarkInterpolate($value, $baseUrl);
+    return $value;
+}
+
+function benchmarkInterpolate(string $value, string $baseUrl): string {
+    return str_replace('{base_url}', rtrim($baseUrl, '/'), $value);
+}
+
+function benchmarkOutputTail(string $output): string {
+    $lines = preg_split('/\r\n|\n|\r/', trim($output)) ?: [];
+    return implode("\n", array_slice($lines, -20));
+}
+
+function aggregateBenchmarkResults(array $results, float $duration): array {
+    $total = count($results);
+    $matched = count(array_filter($results, fn(array $result): bool => (bool)$result['matched_expectation']));
+    $failures = array_sum(array_column($results, 'failures'));
+    $unexpected = $total - $matched;
+    $operationsSelected = array_sum(array_column($results, 'operations_selected'));
+    $operationsTotal = array_sum(array_column($results, 'operations_total'));
+    $cases = array_sum(array_column($results, 'cases'));
+    $passed = array_sum(array_column($results, 'passed'));
+    $skipped = array_sum(array_column($results, 'skipped'));
+    $qualityScore = $total === 0 ? 0.0 : max(0.0, round(($matched / $total) * 100 - min(25, $unexpected * 5), 1));
+    return [
+        'duration' => round($duration, 6),
+        'benchmark_cases' => $total,
+        'matched_expectations' => $matched,
+        'unexpected_results' => $unexpected,
+        'operations_selected' => $operationsSelected,
+        'operations_total' => $operationsTotal,
+        'cases' => $cases,
+        'passed' => $passed,
+        'failures' => $failures,
+        'skipped' => $skipped,
+        'quality_score' => $qualityScore
+    ];
+}
+
+function compareBenchmarkResults(array $current, array $baseline): array {
+    return [
+        'quality_score_delta' => round((float)($current['quality_score'] ?? 0) - (float)($baseline['quality_score'] ?? 0), 1),
+        'failure_delta' => (int)($current['failures'] ?? 0) - (int)($baseline['failures'] ?? 0),
+        'case_delta' => (int)($current['cases'] ?? 0) - (int)($baseline['cases'] ?? 0),
+        'unexpected_result_delta' => (int)($current['unexpected_results'] ?? 0) - (int)($baseline['unexpected_results'] ?? 0)
+    ];
+}
+
+function writeBenchmarkFile(string $path, string $content): void {
+    $dir = dirname($path);
+    if ($dir !== '.' && !is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+        fwrite(STDERR, "Could not create benchmark directory: {$dir}\n");
+        return;
+    }
+    file_put_contents($path, $content);
+}
+
+function benchmarkMarkdown(array $report): string {
+    $aggregate = $report['aggregate'];
+    $lines = [
+        '# Benchmark Summary',
+        '',
+        '- Suite: ' . ($report['suite']['name'] ?? ''),
+        '- Created: ' . ($report['created_at'] ?? ''),
+        '- Quality score: ' . $aggregate['quality_score'] . '/100',
+        '- Runtime: ' . sprintf('%.3fs', $aggregate['duration']),
+        '- Cases executed: ' . $aggregate['cases'],
+        '- Failures observed: ' . $aggregate['failures'],
+        '- Unexpected results: ' . $aggregate['unexpected_results'],
+        '',
+        '| Case | Result | Runtime | Cases | Failures |',
+        '| --- | --- | ---: | ---: | ---: |'
+    ];
+    foreach (($report['results'] ?? []) as $result) {
+        $lines[] = '| ' . $result['name'] . ' | ' . ($result['matched_expectation'] ? 'OK' : 'FAIL') . ' | ' . sprintf('%.3fs', $result['duration']) . ' | ' . $result['cases'] . ' | ' . $result['failures'] . ' |';
+    }
+    if ($report['comparison'] ?? null) {
+        $comparison = $report['comparison'];
+        $lines[] = '';
+        $lines[] = '## Baseline Comparison';
+        $lines[] = '';
+        $lines[] = '- Quality score delta: ' . sprintf('%+.1f', $comparison['quality_score_delta']);
+        $lines[] = '- Failure delta: ' . sprintf('%+d', $comparison['failure_delta']);
+        $lines[] = '- Case delta: ' . sprintf('%+d', $comparison['case_delta']);
+        $lines[] = '- Unexpected result delta: ' . sprintf('%+d', $comparison['unexpected_result_delta']);
+    }
+    return implode("\n", $lines) . "\n";
 }
 
 function defaultConfigPath(): string {
@@ -814,6 +1049,10 @@ function longOptionRequiresValue(string $option): bool {
         'report',
         'report-dir',
         'cache-dir',
+        'base-url',
+        'benchmark-output',
+        'benchmark-markdown',
+        'benchmark-baseline',
         'report-junit-path',
         'report-vcr-path',
         'report-har-path',
@@ -3194,6 +3433,21 @@ function printSummary(array $operations, array $phaseResults, array $state): voi
     if ($skipped) echo ", {$skipped} skipped";
     echo "\n";
     echo "Seed: {$state['seed']}\n";
+}
+
+function runSummary(array $operations, array $phaseResults, array $state): array {
+    return [
+        'operations_selected' => count($operations),
+        'operations_total' => (int)($state['total_operations'] ?? count($operations)),
+        'cases' => (int)($state['cases'] ?? 0),
+        'passed' => (int)array_sum(array_column($phaseResults, 'passed')),
+        'failed' => count($state['failures'] ?? []),
+        'skipped' => (int)array_sum(array_column($phaseResults, 'skipped')),
+        'seed' => $state['seed'] ?? null,
+        'phases' => $phaseResults,
+        'warnings' => $state['warnings'] ?? [],
+        'failure_messages' => $state['failures'] ?? []
+    ];
 }
 
 function writeReports(array $state, array $phaseResults): void {

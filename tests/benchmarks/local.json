@@ -1,0 +1,89 @@
+{
+    "name": "local-runtime-corpus",
+    "base-url": "http://127.0.0.1:8089",
+    "defaults": {
+        "seed": 123,
+        "max-examples": 1,
+        "request-timeout": 5,
+        "report": "ndjson,junit",
+        "report-dir": "/tmp/openapi-contract-benchmark-reports",
+        "cache-dir": "/tmp/openapi-contract-benchmark-cache"
+    },
+    "cases": [
+        {
+            "name": "openapi-basic",
+            "schema": "tests/fixtures/openapi.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples,coverage,fuzzing"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "openapi-yaml",
+            "schema": "tests/fixtures/openapi.yaml",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "swagger2-basic",
+            "schema": "tests/fixtures/swagger2.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "graphql-basic",
+            "schema": "tests/fixtures/schema.graphql",
+            "url": "{base_url}/graphql",
+            "options": {
+                "phases": "examples,fuzzing"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "advanced-contract-stateful",
+            "schema": "tests/fixtures/openapi-advanced.json",
+            "url": "{base_url}",
+            "options": {
+                "phases": "examples,coverage,stateful",
+                "checks": "all",
+                "auth-api-key": "ApiKeyAuth:secret"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "advanced-fuzz-all",
+            "command": "fuzz",
+            "schema": "tests/fixtures/openapi-advanced.json",
+            "url": "{base_url}",
+            "options": {
+                "mode": "all",
+                "checks": "not_a_server_error,negative_data_rejection,positive_data_acceptance",
+                "auth-api-key": "ApiKeyAuth:secret"
+            },
+            "expected_exit_code": 0,
+            "expected_failures": 0
+        },
+        {
+            "name": "detect-undocumented-status",
+            "schema": "tests/fixtures/openapi.json",
+            "url": "{base_url}/bad",
+            "options": {
+                "phases": "examples"
+            },
+            "expected_exit_code": 1,
+            "expected_failures": 1
+        }
+    ]
+}

@@ -58,6 +58,12 @@ Run from config:
 php bin/openapi-contract run --config openapi-contract.json
 ```
 
+Run the local benchmark corpus:
+
+```bash
+php bin/openapi-contract benchmark tests/benchmarks/local.json
+```
+
 ```bash
 php bin/openapi-contract run https://api.example.com/openapi.json --phases examples,coverage,fuzzing --max-examples 5
 ```
@@ -130,7 +136,8 @@ resource dependency inference. Complex API workflows may need explicit links in
 the schema.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature matrix and milestone
-order.
+order. See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for repeatable local
+quality measurements.
 
 ## Requirements
 

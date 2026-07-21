@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * PHP-native OpenAPI contract and fuzz testing runner.
  *
- * This intentionally mirrors the Schemathesis CLI shape used in this repo:
+ * The CLI is designed for local OpenAPI contract and fuzz testing:
  *
  *   php bin/openapi-contract run LOCATION --phases examples,coverage,fuzzing --max-examples 5
  *
@@ -17,9 +17,9 @@ declare(strict_types=1);
  * - response_schema_conformance
  * - unsupported_method
  *
- * It is not a byte-for-byte port of Schemathesis/Hypothesis. Full parity would
- * require a property-based testing engine, shrinking, replay storage, stateful
- * links, reports, GraphQL support, and a much larger OpenAPI implementation.
+ * Full feature coverage still requires a property-based testing engine,
+ * shrinking, replay storage, stateful links, reports, GraphQL support, and a
+ * much larger OpenAPI implementation.
  */
 
 const DEFAULT_CHECKS = [
@@ -147,7 +147,7 @@ function printUsage(): void {
     echo "  php bin/openapi-contract fuzz [OPTIONS] LOCATION\n\n";
     echo "Options:\n";
     echo "  -u, --url URL                  API base URL for file-based schemas\n";
-    echo "  -w, --workers N|auto           Accepted for Schemathesis CLI compatibility\n";
+    echo "  -w, --workers N|auto           Worker count (currently sequential)\n";
     echo "  -H, --header NAME:VALUE        Add a custom HTTP header\n";
     echo "  -a, --auth USER:PASS           Basic authentication\n";
     echo "  --phases LIST                  examples,coverage,fuzzing,stateful\n";
@@ -403,7 +403,7 @@ function parseRateLimit(string $value): ?float {
 
 function addCompatibilityWarnings(array $options, array $phases, array $checks, string $command, array $schema, array &$warnings): void {
     foreach (array_diff($checks, IMPLEMENTED_CHECKS) as $check) {
-        $warnings[] = "Check '{$check}' is accepted for Schemathesis compatibility but is not implemented yet.";
+        $warnings[] = "Check '{$check}' is accepted but is not implemented yet.";
     }
     if (in_array('stateful', $phases, true)) {
         $warnings[] = "Stateful testing is accepted in --phases but skipped until link/workflow execution is implemented.";

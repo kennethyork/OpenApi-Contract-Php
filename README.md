@@ -2,16 +2,15 @@
 
 PHP-native OpenAPI contract and fuzz testing runner.
 
-This tool is a vanilla PHP CLI for Schemathesis-style OpenAPI contract testing.
-It loads an OpenAPI 3.x document, runs examples, coverage checks, and generated
-fuzz cases against an HTTP API, then validates status codes, JSON content types,
+This tool is a vanilla PHP CLI for OpenAPI contract and fuzz testing. It loads
+an OpenAPI 3.x document, runs examples, coverage checks, and generated fuzz
+cases against an HTTP API, then validates status codes, JSON content types,
 response headers, response schemas, server errors, and unsupported method
 handling.
 
-The target is runtime parity with Schemathesis in PHP: local CLI commands,
+The target is a complete local API testing workflow in PHP: CLI commands,
 checks, generation, filtering, stateful workflows, reports, replay, auth, and
-extensibility. CI/CD integrations are intentionally out of scope, and this CLI
-does not install, import, shell out to, or require Schemathesis.
+extensibility. CI/CD integrations are intentionally out of scope.
 
 ## Usage
 
@@ -65,13 +64,13 @@ Useful options:
 - `response_schema_conformance`
 - `unsupported_method`
 
-The CLI also accepts Schemathesis runtime checks that are not implemented yet,
+The CLI also accepts planned runtime checks that are not implemented yet,
 including `negative_data_rejection`, `positive_data_acceptance`,
 `use_after_free`, `ensure_resource_availability`, `ignored_auth`, and
 `missing_required_header`. Those checks produce warnings until their engines are
 implemented.
 
-See [docs/PARITY.md](docs/PARITY.md) for the PHP parity matrix and milestone
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature matrix and milestone
 order.
 
 ## Requirements

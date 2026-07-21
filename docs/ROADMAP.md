@@ -5,6 +5,13 @@ and fuzz testing. CI/CD integrations are intentionally excluded; local reports,
 replay, config, auth, stateful testing, GraphQL, and extension points remain in
 scope.
 
+## Product Scope
+
+The project is positioned as a dependency-free PHP runtime tester, not only a
+static OpenAPI validator. Its core value is local execution of contract checks,
+generated cases, replay, auth probes, and stateful workflows without Composer,
+hosted services, or CI/CD coupling.
+
 ## Current Native Support
 
 | Area | Status | Notes |

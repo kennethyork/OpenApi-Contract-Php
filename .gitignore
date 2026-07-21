@@ -2,4 +2,6 @@
 /.phpunit.cache/
 /.openapi-contract/
 /openapi-contract-report/
+/openapi-contract.json
+/.openapi-contract.json
 *.log

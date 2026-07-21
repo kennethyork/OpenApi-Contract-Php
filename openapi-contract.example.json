@@ -1,0 +1,36 @@
+{
+    "schema-location": "tests/fixtures/openapi-advanced.json",
+    "url": "http://127.0.0.1:8089",
+    "phases": "examples,coverage,fuzzing,stateful",
+    "checks": "all",
+    "max-examples": 25,
+    "request-timeout": 10,
+    "request-retries": 0,
+    "max-redirects": 0,
+    "headers": [
+        "X-Client: local"
+    ],
+    "auth": {
+        "openapi": {
+            "ApiKeyAuth": {
+                "api-key": "secret"
+            }
+        }
+    },
+    "cache-dir": ".openapi-contract/cache",
+    "reports": {
+        "directory": "openapi-contract-report",
+        "ndjson": {
+            "enabled": true
+        },
+        "junit": {
+            "enabled": true
+        },
+        "har": {
+            "enabled": true
+        },
+        "vcr": {
+            "enabled": true
+        }
+    }
+}

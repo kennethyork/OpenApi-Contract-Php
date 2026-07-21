@@ -1,6 +1,7 @@
 # openapi-contract-php
 
-PHP-native OpenAPI contract and fuzz testing runner.
+Zero-dependency PHP CLI for local OpenAPI and GraphQL contract testing,
+fuzzing, replay, and stateful API checks.
 
 This tool is a vanilla PHP CLI for OpenAPI and GraphQL contract and fuzz
 testing. It loads OpenAPI 2.0/3.x JSON or YAML documents and simple GraphQL SDL
@@ -12,6 +13,20 @@ enforcement, required request headers, and unsupported method handling.
 The target is a complete local API testing workflow in PHP: CLI commands,
 checks, generation, filtering, stateful workflows, reports, replay, auth, and
 extensibility. CI/CD integrations are intentionally out of scope.
+
+## Positioning
+
+This is not just a static spec linter. It reads an API description, generates
+HTTP traffic, validates live responses against the contract, records failures,
+and replays saved repro cases.
+
+The distinct angle is:
+
+- vanilla PHP CLI
+- no Composer dependency
+- no hosted service dependency
+- no CI/CD coupling
+- local contract, fuzz, replay, auth, and stateful workflow checks in one tool
 
 ## Usage
 
@@ -26,6 +41,10 @@ Create a reusable config interactively:
 ```bash
 php bin/openapi-contract init
 ```
+
+The repository includes `openapi-contract.example.json` as a safe fixture
+configuration. Local generated config files are gitignored because they may
+contain environment-specific URLs, headers, or credentials.
 
 Check the local PHP/runtime/schema setup:
 

@@ -33,7 +33,7 @@ hosted services, or CI/CD coupling.
 | Fuzzing phase | Partial | Generates positive and negative schema-driven values with lightweight JSON shrinking. |
 | Filtering | Supported | Path, method, name, tag, operation id, regex, expression basics, and deprecated exclusion. |
 | Network options | Partial | Headers, basic auth, bearer auth, API keys, proxy, TLS verify, redirects, retries, timeout, certs, and rate limit; execution remains sequential. |
-| Reports | Supported | JUnit XML, HAR, NDJSON events, and VCR-style cassette output with sanitization/truncation controls. |
+| Reports | Supported | JUnit XML, HAR, NDJSON events, VCR-style cassette, self-contained HTML, and curl reproducer output with sanitization/truncation controls. |
 | `not_a_server_error` | Supported | Detects HTTP 5xx responses. |
 | `status_code_conformance` | Supported | Exact, wildcard class, and default responses are handled. |
 | `content_type_conformance` | Supported | JSON-compatible and documented media types are handled. |

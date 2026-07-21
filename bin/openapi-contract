@@ -168,6 +168,7 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
         'warnings' => $warnings,
         'cases' => 0,
         'case_records' => [],
+        'failure_reproducers' => [],
         'total_operations' => count($allOperations),
         'seed' => $seed,
         'last_request_at' => null,
@@ -245,12 +246,14 @@ function printUsage(): void {
     echo "  --max-redirects N              Follow up to N redirects\n";
     echo "  --proxy URL                    HTTP proxy URL\n";
     echo "  --tls-verify true|false|PATH   TLS verification setting\n";
-    echo "  --report FORMAT                junit,har,ndjson,vcr\n";
+    echo "  --report FORMAT                junit,har,ndjson,vcr,html,curl\n";
     echo "  --report-dir DIRECTORY         Directory for generated reports\n";
     echo "  --report-junit-path FILE       JUnit XML output path\n";
     echo "  --report-har-path FILE         HAR output path\n";
     echo "  --report-ndjson-path FILE      NDJSON events output path\n";
     echo "  --report-vcr-path FILE         Request/response cassette path\n";
+    echo "  --report-html-path FILE        Self-contained HTML report path\n";
+    echo "  --report-curl-path FILE        Shell reproducers for failing cases\n";
     echo "  --cache-dir DIRECTORY          Crash/replay cache directory\n";
     echo "  --base-url URL                 Benchmark suite base URL placeholder\n";
     echo "  --benchmark-output FILE        Benchmark JSON result path\n";
@@ -341,7 +344,7 @@ function runInitCommand(?string $target, array $options): int {
     $maxRedirects = optionString($options, 'max-redirects', '0');
     $auth = optionString($options, 'auth', '');
     $headers = optionValues($options, 'header');
-    $reports = csvOption($options, 'report', ['ndjson', 'junit']);
+    $reports = csvOption($options, 'report', ['ndjson', 'junit', 'html', 'curl']);
     $reportDir = optionString($options, 'report-dir', DEFAULT_REPORT_DIR);
     $cacheDir = optionString($options, 'cache-dir', DEFAULT_CACHE_DIR);
 
@@ -398,7 +401,7 @@ function runInitCommand(?string $target, array $options): int {
         [$username, $password] = array_pad(explode(':', $auth, 2), 2, '');
         $config['auth'] = ['basic' => ['username' => $username, 'password' => $password]];
     }
-    $reports = array_values(array_intersect($reports, ['junit', 'har', 'ndjson', 'vcr']));
+    $reports = array_values(array_intersect($reports, ['junit', 'har', 'ndjson', 'vcr', 'html', 'curl']));
     if ($reports) {
         $config['reports'] = ['directory' => $reportDir];
         foreach ($reports as $format) {
@@ -640,13 +643,17 @@ function benchmarkCaseOptions(array $case, array $suite, array $globalOptions, s
     $options = [];
     foreach (($suite['defaults'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
     foreach (($case['options'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
-    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'report', 'auth', 'auth-token', 'pro-path', 'pro-output-dir', 'pro-project', 'pro-customer', 'pro-rules'] as $key) {
+    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'report', 'report-html-path', 'report-curl-path', 'auth', 'auth-token', 'pro-path', 'pro-output-dir', 'pro-project', 'pro-customer', 'pro-rules'] as $key) {
         if (array_key_exists($key, $globalOptions)) $options[$key] = $globalOptions[$key];
     }
     if (isset($globalOptions['auth-api-key'])) $options['auth-api-key'] = $globalOptions['auth-api-key'];
     if (isset($globalOptions['header'])) $options['header'] = $globalOptions['header'];
     if (isset($case['url'])) $options['url'] = benchmarkInterpolate((string)$case['url'], $baseUrl);
     if (isset($globalOptions['url'])) $options['url'] = benchmarkInterpolate((string)$globalOptions['url'], $baseUrl);
+    $options['benchmark-case-name'] = benchmarkCaseSlug($case);
+    if (isset($options['report-dir']) && trim((string)$options['report-dir']) !== '') {
+        $options['report-dir'] = rtrim((string)$options['report-dir'], DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $options['benchmark-case-name'];
+    }
     return $options;
 }
 
@@ -658,6 +665,12 @@ function benchmarkOptionValue($value, string $baseUrl) {
 
 function benchmarkInterpolate(string $value, string $baseUrl): string {
     return str_replace('{base_url}', rtrim($baseUrl, '/'), $value);
+}
+
+function benchmarkCaseSlug(array $case): string {
+    $name = trim((string)($case['name'] ?? basename((string)($case['schema'] ?? 'case'))));
+    $slug = trim((string)preg_replace('/[^a-zA-Z0-9_.-]+/', '-', $name), '-');
+    return $slug === '' ? 'case' : $slug;
 }
 
 function benchmarkOutputTail(string $output): string {
@@ -1138,6 +1151,8 @@ function longOptionRequiresValue(string $option): bool {
         'report-vcr-path',
         'report-har-path',
         'report-ndjson-path',
+        'report-html-path',
+        'report-curl-path',
         'output-sanitize',
         'output-truncate',
         'mode',
@@ -1289,7 +1304,7 @@ function flattenAuthConfig(array $auth, array &$options): void {
 
 function flattenReportConfig(array $reports, array &$options): void {
     if (isset($reports['directory'])) $options['report-dir'] = (string)$reports['directory'];
-    foreach (['junit', 'har', 'ndjson', 'vcr'] as $format) {
+    foreach (['junit', 'har', 'ndjson', 'vcr', 'html', 'curl'] as $format) {
         if (!isset($reports[$format]) || !is_array($reports[$format])) continue;
         if (($reports[$format]['enabled'] ?? false) || isset($reports[$format]['path'])) {
             appendOption($options, 'report', $format);
@@ -1320,10 +1335,10 @@ function mergeOptionValue($default, $override) {
 
 function reportOptionsFromOptions(array $options): array {
     $formats = csvOption($options, 'report', []);
-    foreach (['junit', 'har', 'ndjson', 'vcr'] as $format) {
+    foreach (['junit', 'har', 'ndjson', 'vcr', 'html', 'curl'] as $format) {
         if (isset($options["report-{$format}-path"])) $formats[] = $format;
     }
-    $formats = array_values(array_unique(array_filter($formats, fn(string $format) => in_array($format, ['junit', 'har', 'ndjson', 'vcr'], true))));
+    $formats = array_values(array_unique(array_filter($formats, fn(string $format) => in_array($format, ['junit', 'har', 'ndjson', 'vcr', 'html', 'curl'], true))));
     $dir = rtrim((string)($options['report-dir'] ?? DEFAULT_REPORT_DIR), DIRECTORY_SEPARATOR);
     return [
         'formats' => $formats,
@@ -1332,7 +1347,9 @@ function reportOptionsFromOptions(array $options): array {
             'junit' => $options['report-junit-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'junit.xml'),
             'har' => $options['report-har-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'traffic.har'),
             'ndjson' => $options['report-ndjson-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'events.ndjson'),
-            'vcr' => $options['report-vcr-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'cassette.yaml')
+            'vcr' => $options['report-vcr-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'cassette.yaml'),
+            'html' => $options['report-html-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'report.html'),
+            'curl' => $options['report-curl-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'reproducers.sh')
         ],
         'preserve_bytes' => (bool)($options['report-preserve-bytes'] ?? false)
     ];
@@ -2866,6 +2883,7 @@ function recordCase(array &$state, array $request, ?array $response, ?string $fa
     $id = caseId($request, $response, $failure, count($state['case_records'] ?? []));
     $sanitize = (bool)($state['output_sanitize'] ?? true);
     $truncate = (bool)($state['output_truncate'] ?? true);
+    $normalizedRequest = normalizeRequestForRecord($request, $sanitize, $truncate);
     $case = [
         'id' => $id,
         'time' => gmdate('c'),
@@ -2874,9 +2892,10 @@ function recordCase(array &$state, array $request, ?array $response, ?string $fa
         'checks' => $state['checks'] ?? [],
         'max_response_time' => $state['max_response_time'] ?? null,
         'components' => $state['components'] ?? [],
-        'request' => normalizeRequestForRecord($request, $sanitize, $truncate),
+        'request' => $normalizedRequest,
         'response' => normalizeResponseForRecord($response, $sanitize, $truncate),
-        'failure' => $failure
+        'failure' => $failure,
+        'curl' => curlCommandFromRequest($normalizedRequest)
     ];
     $state['case_records'][] = $case;
     return $case;
@@ -2899,6 +2918,21 @@ function normalizeRequestForRecord(array $request, bool $sanitize, bool $truncat
     $request['headers'] = normalizeHeadersForRecord($request['headers'] ?? [], $sanitize);
     if (isset($request['body']) && is_string($request['body'])) $request['body'] = normalizeBodyForRecord($request['body'], $sanitize, $truncate);
     return $request;
+}
+
+function curlCommandFromRequest(array $request): string {
+    $parts = ['curl', '-i', '-sS', '-X', escapeshellarg((string)($request['method'] ?? 'GET')), escapeshellarg((string)($request['url'] ?? ''))];
+    foreach (($request['headers'] ?? []) as $header) {
+        $header = trim((string)$header);
+        if ($header === '' || !str_contains($header, ':')) continue;
+        $parts[] = '-H';
+        $parts[] = escapeshellarg($header);
+    }
+    if (array_key_exists('body', $request) && $request['body'] !== null) {
+        $parts[] = '--data-raw';
+        $parts[] = escapeshellarg((string)$request['body']);
+    }
+    return implode(' ', $parts);
 }
 
 function normalizeResponseForRecord(?array $response, bool $sanitize = true, bool $truncate = true): ?array {
@@ -3012,6 +3046,7 @@ function extractLinkValue($expression, array $case) {
 function recordFailure(array &$state, array &$result, string $message, ?array $case = null): void {
     $result['failed']++;
     $state['failures'][] = $case ? "{$message} (case {$case['id']})" : $message;
+    $state['failure_reproducers'][] = $case['curl'] ?? null;
     if ($case !== null) saveCrashFile($state, $case);
 }
 
@@ -3030,7 +3065,8 @@ function saveCrashFile(array $state, array $case): void {
         'operation' => $case['request']['operation']['operation'] ?? null,
         'operation_path' => $case['request']['operation']['path'] ?? null,
         'request' => $case['request'],
-        'failure' => $case['failure']
+        'failure' => $case['failure'],
+        'curl' => $case['curl'] ?? null
     ];
     file_put_contents($path, json_encode($crash, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
@@ -3484,6 +3520,8 @@ function printFailures(array $state): void {
     foreach ($state['failures'] as $index => $failure) {
         $number = $index + 1;
         echo "{$number}. {$failure}\n";
+        $curl = $state['failure_reproducers'][$index] ?? null;
+        if (is_string($curl) && $curl !== '') echo "   Reproduce: {$curl}\n";
     }
     echo "\n";
 }
@@ -3546,10 +3584,13 @@ function writeReports(array $state, array $phaseResults): void {
             'har' => harReport($state),
             'ndjson' => ndjsonReport($state, $phaseResults),
             'vcr' => vcrReport($state),
+            'html' => htmlReport($state, $phaseResults),
+            'curl' => curlReport($state),
             default => null
         };
         if ($content !== null) {
             file_put_contents($path, $content);
+            if ($format === 'curl') @chmod($path, 0755);
             echo "Report written: {$path}\n";
         }
     }
@@ -3658,6 +3699,69 @@ function vcrReport(array $state): string {
     return implode("\n", $lines) . "\n";
 }
 
+function htmlReport(array $state, array $phaseResults): string {
+    $cases = $state['case_records'] ?? [];
+    $failures = array_values(array_filter($cases, fn(array $case): bool => $case['failure'] !== null));
+    $passed = (int)array_sum(array_column($phaseResults, 'passed'));
+    $failed = count($failures);
+    $skipped = (int)array_sum(array_column($phaseResults, 'skipped'));
+    $phaseRows = '';
+    foreach ($phaseResults as $phase => $result) {
+        $phaseRows .= '<tr><td>' . htmlEscape((string)$phase) . '</td><td>' . ($result['failed'] ? 'FAIL' : 'OK') . '</td><td>' . (int)$result['passed'] . '</td><td>' . (int)$result['failed'] . '</td><td>' . (int)$result['skipped'] . '</td><td>' . htmlEscape(sprintf('%.3fs', (float)($result['duration'] ?? 0))) . '</td></tr>';
+    }
+    $failureRows = '';
+    foreach ($failures as $case) {
+        $failureRows .= '<tr><td>' . htmlEscape($case['id'] ?? '') . '</td><td>' . htmlEscape(($case['request']['method'] ?? '') . ' ' . ($case['request']['path_query'] ?? $case['request']['url'] ?? '')) . '</td><td>' . htmlEscape((string)$case['failure']) . '</td><td><pre>' . htmlEscape((string)($case['curl'] ?? '')) . '</pre></td></tr>';
+    }
+    if ($failureRows === '') $failureRows = '<tr><td colspan="4">No failures.</td></tr>';
+    $caseRows = '';
+    foreach (array_slice($cases, 0, 500) as $case) {
+        $response = $case['response'] ?? [];
+        $caseRows .= '<tr><td>' . htmlEscape($case['id'] ?? '') . '</td><td>' . htmlEscape((string)($case['request']['phase'] ?? '')) . '</td><td>' . htmlEscape((string)($case['request']['method'] ?? '')) . '</td><td>' . htmlEscape((string)($case['request']['path_query'] ?? $case['request']['url'] ?? '')) . '</td><td>' . htmlEscape((string)($response['status'] ?? '')) . '</td><td>' . htmlEscape($case['failure'] === null ? 'OK' : 'FAIL') . '</td></tr>';
+    }
+    $warnings = '';
+    foreach (($state['warnings'] ?? []) as $warning) $warnings .= '<li>' . htmlEscape((string)$warning) . '</li>';
+    if ($warnings === '') $warnings = '<li>No warnings.</li>';
+
+    return '<!doctype html><html><head><meta charset="utf-8"><title>openapi-contract-php report</title><style>'
+        . 'body{font-family:Arial,sans-serif;margin:32px;color:#17202a;background:#f7f9fb}h1{margin:0 0 8px}h2{margin-top:28px}.meta{color:#52616f}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0}.metric{background:#fff;border:1px solid #d8e1ea;border-radius:6px;padding:14px}.metric b{display:block;font-size:24px;margin-top:4px}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8e1ea}th,td{text-align:left;border-bottom:1px solid #e7edf3;padding:8px;vertical-align:top}th{background:#eef3f7}pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px}@media print{body{background:#fff;margin:16px}.metric,table{break-inside:avoid}}'
+        . '</style></head><body>'
+        . '<h1>openapi-contract-php report</h1>'
+        . '<p class="meta">Schema: ' . htmlEscape((string)($state['schema_location'] ?? '')) . ' | Base URL: ' . htmlEscape((string)($state['base_url'] ?? '')) . ' | Seed: ' . htmlEscape((string)($state['seed'] ?? '')) . '</p>'
+        . '<section class="metrics">'
+        . htmlMetric('Cases', (string)($state['cases'] ?? count($cases)))
+        . htmlMetric('Passed', (string)$passed)
+        . htmlMetric('Failed', (string)$failed)
+        . htmlMetric('Skipped', (string)$skipped)
+        . '</section>'
+        . '<h2>Failures</h2><table><thead><tr><th>Case</th><th>Operation</th><th>Failure</th><th>Reproducer</th></tr></thead><tbody>' . $failureRows . '</tbody></table>'
+        . '<h2>Phases</h2><table><thead><tr><th>Phase</th><th>Status</th><th>Passed</th><th>Failed</th><th>Skipped</th><th>Runtime</th></tr></thead><tbody>' . $phaseRows . '</tbody></table>'
+        . '<h2>Cases</h2><table><thead><tr><th>Case</th><th>Phase</th><th>Method</th><th>Path</th><th>Status</th><th>Result</th></tr></thead><tbody>' . $caseRows . '</tbody></table>'
+        . '<h2>Warnings</h2><ul>' . $warnings . '</ul>'
+        . '</body></html>';
+}
+
+function curlReport(array $state): string {
+    $lines = ['#!/usr/bin/env sh', 'set -eu', ''];
+    $failures = array_values(array_filter($state['case_records'] ?? [], fn(array $case): bool => $case['failure'] !== null));
+    if (!$failures) {
+        $lines[] = "echo 'No failing cases were recorded.'";
+        return implode("\n", $lines) . "\n";
+    }
+    foreach ($failures as $index => $case) {
+        $number = $index + 1;
+        $lines[] = '# Failure ' . $number . ': case ' . ($case['id'] ?? '');
+        $lines[] = '# ' . str_replace(["\r", "\n"], ' ', (string)($case['failure'] ?? ''));
+        $lines[] = (string)($case['curl'] ?? '');
+        $lines[] = '';
+    }
+    return implode("\n", $lines) . "\n";
+}
+
+function htmlMetric(string $label, string $value): string {
+    return '<div class="metric"><span>' . htmlEscape($label) . '</span><b>' . htmlEscape($value) . '</b></div>';
+}
+
 function headerLinesToHar(array $headers): array {
     $result = [];
     foreach ($headers as $header) {
@@ -3686,6 +3790,10 @@ function queryStringToHar(string $query): array {
 
 function xmlEscape(string $value): string {
     return htmlspecialchars($value, ENT_QUOTES | ENT_XML1, 'UTF-8');
+}
+
+function htmlEscape(string $value): string {
+    return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
 function yamlScalar(string $value): string {

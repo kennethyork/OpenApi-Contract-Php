@@ -21,7 +21,7 @@ Core runtime features:
 - built-in runtime contract checks
 - replay
 - benchmark suites
-- JUnit, HAR, NDJSON, and VCR reports
+- JUnit, HAR, NDJSON, VCR, HTML, and curl reproducer reports
 - interactive CLI
 
 Advanced bundled features:
@@ -67,6 +67,17 @@ Benchmark artifacts:
 - `benchmark-dashboard.html`
 - `benchmark-dashboard.pdf`
 - `trend.html`
+
+Core HTML/curl reports are available without the advanced hook:
+
+```bash
+php bin/openapi-contract run openapi.json \
+  --url http://127.0.0.1:8080 \
+  --report html,curl
+```
+
+When `benchmark` runs with a `--report-dir`, each benchmark case gets its own
+subdirectory so HTML reports and curl reproducers are not overwritten.
 
 By default these go to `openapi-contract-advanced-report`. Override the output
 directory with:

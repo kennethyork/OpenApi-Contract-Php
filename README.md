@@ -8,7 +8,8 @@ testing. It loads OpenAPI 2.0/3.x JSON or YAML documents and simple GraphQL SDL
 files, runs examples, coverage checks, generated fuzz cases, and stateful
 workflows against an HTTP API, then validates status codes, content types,
 response headers, response schemas, server errors, input rejection, auth
-enforcement, required request headers, and unsupported method handling.
+enforcement, required request headers, and unsupported method handling. Failed
+cases include ready-to-run curl reproducers.
 
 The target is a complete local API testing workflow in PHP: CLI commands,
 checks, generation, filtering, stateful workflows, reports, replay, auth, and
@@ -131,7 +132,7 @@ Useful options:
 --max-redirects 3
 --proxy http://127.0.0.1:8081
 --tls-verify false
---report ndjson,junit
+--report ndjson,junit,html,curl
 --report-dir openapi-contract-report
 --cache-dir .openapi-contract/cache
 --seed 1234

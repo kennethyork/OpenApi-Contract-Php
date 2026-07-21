@@ -27,6 +27,8 @@ function openapi_contract_pro_after_run(array $state, array $phaseResults, array
     $options = $state['options'] ?? [];
     $project = ocp_pro_project($options, $state['schema_location'] ?? null);
     $outDir = ocp_pro_output_dir($options);
+    $benchmarkCase = ocp_pro_option($options, 'benchmark-case-name', '');
+    if ($benchmarkCase !== '') $outDir .= '/runs/' . ocp_pro_slug($benchmarkCase);
     ocp_pro_ensure_dir($outDir);
 
     $findings = ocp_pro_governance_findings($state, $summary, $options);
@@ -384,7 +386,7 @@ function ocp_pro_audit_html(array $audit): string {
     if ($rows === '') $rows = '<tr><td colspan="4">No advanced findings.</td></tr>';
     $cases = '';
     foreach (array_slice($audit['cases'] ?? [], 0, 200) as $case) {
-        $cases .= '<tr><td>' . ocp_pro_h($case['id'] ?? '') . '</td><td>' . ocp_pro_h($case['request']['method'] ?? '') . '</td><td>' . ocp_pro_h($case['request']['path_query'] ?? '') . '</td><td>' . ocp_pro_h((string)($case['response']['status'] ?? '')) . '</td><td>' . ocp_pro_h($case['failure'] ?? '') . '</td></tr>';
+        $cases .= '<tr><td>' . ocp_pro_h($case['id'] ?? '') . '</td><td>' . ocp_pro_h($case['request']['method'] ?? '') . '</td><td>' . ocp_pro_h($case['request']['path_query'] ?? '') . '</td><td>' . ocp_pro_h((string)($case['response']['status'] ?? '')) . '</td><td>' . ocp_pro_h($case['failure'] ?? '') . '</td><td><pre>' . ocp_pro_h($case['curl'] ?? '') . '</pre></td></tr>';
     }
     return ocp_pro_html_shell('Audit Dashboard', '<h1>OpenAPI Contract Audit</h1>'
         . '<section class="metrics">'
@@ -395,7 +397,7 @@ function ocp_pro_audit_html(array $audit): string {
         . ocp_pro_metric('Findings', (string)count($findings))
         . '</section>'
         . '<h2>Findings</h2><table><thead><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Remediation</th></tr></thead><tbody>' . $rows . '</tbody></table>'
-        . '<h2>Evidence</h2><table><thead><tr><th>Case</th><th>Method</th><th>Path</th><th>Status</th><th>Failure</th></tr></thead><tbody>' . $cases . '</tbody></table>');
+        . '<h2>Evidence</h2><table><thead><tr><th>Case</th><th>Method</th><th>Path</th><th>Status</th><th>Failure</th><th>Reproducer</th></tr></thead><tbody>' . $cases . '</tbody></table>');
 }
 
 function ocp_pro_benchmark_html(array $dashboard): string {
@@ -427,7 +429,7 @@ function ocp_pro_trend_html(string $project): string {
 
 function ocp_pro_html_shell(string $title, string $body): string {
     return '<!doctype html><html><head><meta charset="utf-8"><title>' . ocp_pro_h($title) . '</title><style>'
-        . 'body{font-family:Arial,sans-serif;margin:32px;color:#18202a;background:#f8fafc}h1{margin:0 0 16px}h2{margin-top:28px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0}.metric{background:#fff;border:1px solid #d9e2ec;border-radius:6px;padding:14px}.metric b{display:block;font-size:24px}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d9e2ec}th,td{text-align:left;border-bottom:1px solid #e6edf3;padding:8px;vertical-align:top}th{background:#eef3f8}@media print{body{background:#fff;margin:16px}.metric,table{break-inside:avoid}}'
+        . 'body{font-family:Arial,sans-serif;margin:32px;color:#18202a;background:#f8fafc}h1{margin:0 0 16px}h2{margin-top:28px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0}.metric{background:#fff;border:1px solid #d9e2ec;border-radius:6px;padding:14px}.metric b{display:block;font-size:24px}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d9e2ec}th,td{text-align:left;border-bottom:1px solid #e6edf3;padding:8px;vertical-align:top}th{background:#eef3f8}pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px}@media print{body{background:#fff;margin:16px}.metric,table{break-inside:avoid}}'
         . '</style></head><body>' . $body . '</body></html>';
 }
 
@@ -442,6 +444,20 @@ function ocp_pro_remediation_markdown(array $audit): string {
         $lines[] = '  Remediation: ' . $finding['remediation'];
     }
     if (count($lines) === 2) $lines[] = 'No findings.';
+    $failedCases = array_values(array_filter($audit['cases'] ?? [], fn(array $case): bool => ($case['failure'] ?? null) !== null));
+    if ($failedCases) {
+        $lines[] = '';
+        $lines[] = '## Failure Reproducers';
+        $lines[] = '';
+        foreach ($failedCases as $case) {
+            $lines[] = '### Case ' . ($case['id'] ?? '');
+            $lines[] = '';
+            $lines[] = '```bash';
+            $lines[] = (string)($case['curl'] ?? '');
+            $lines[] = '```';
+            $lines[] = '';
+        }
+    }
     return implode("\n", $lines) . "\n";
 }
 
@@ -534,7 +550,12 @@ function ocp_pro_baselines(string $project): array {
 }
 
 function ocp_pro_baseline_path(string $project): string {
-    return OCP_PRO_BASELINE_DIR . '/' . preg_replace('/[^a-zA-Z0-9_.-]/', '-', $project) . '.jsonl';
+    return OCP_PRO_BASELINE_DIR . '/' . ocp_pro_slug($project) . '.jsonl';
+}
+
+function ocp_pro_slug(string $value): string {
+    $slug = trim((string)preg_replace('/[^a-zA-Z0-9_.-]+/', '-', $value), '-');
+    return $slug === '' ? 'default' : $slug;
 }
 
 function ocp_pro_output_dir(array $options): string {

@@ -33,6 +33,34 @@ Useful options:
 --seed 1234
 ```
 
+## Compare With Schemathesis
+
+Use the comparison helper when you want to measure parity against upstream
+Schemathesis. It runs this PHP CLI first, then runs Schemathesis with the same
+shared options.
+
+```bash
+php bin/compare-schemathesis ./openapi.json \
+  --url http://127.0.0.1:8080/api/v1 \
+  --phases examples,fuzzing \
+  --checks not_a_server_error,status_code_conformance,content_type_conformance,response_headers_conformance,response_schema_conformance \
+  --max-examples 10 \
+  --seed 123 \
+  --no-color
+```
+
+The helper looks for `schemathesis`, then `st`, then `uvx schemathesis`. To use
+a specific executable:
+
+```bash
+php bin/compare-schemathesis ./openapi.json --url http://127.0.0.1:8080 --schemathesis-bin /path/to/schemathesis
+```
+
+When comparing against PHP's built-in development server, avoid the coverage
+phase unless your server accepts uncommon HTTP methods and routes them to PHP.
+Schemathesis may send methods such as `QUERY`, which the built-in server rejects
+with `501` before your router can return `405`.
+
 ## Checks
 
 - `not_a_server_error`
@@ -49,3 +77,4 @@ order.
 
 - PHP 8.2+
 - PHP curl extension
+- PHP json extension

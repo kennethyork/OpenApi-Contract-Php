@@ -151,20 +151,32 @@ function parseCli(array $argv): array {
                 [$key, $value] = explode('=', $arg, 2);
                 if ($key === 'header') $options['header'][] = $value;
                 else $options[$key] = $value;
+            } elseif (longOptionRequiresValue($arg)) {
+                $options[$arg] = $argv[++$i] ?? '';
+            } elseif ($arg === 'header') {
+                $options['header'][] = $argv[++$i] ?? '';
             } else {
-                $value = $argv[$i + 1] ?? null;
-                if ($value !== null && !str_starts_with($value, '-')) {
-                    $options[$arg] = $value;
-                    $i++;
-                } else {
-                    $options[$arg] = true;
-                }
+                $options[$arg] = true;
             }
             continue;
         }
         $location = $arg;
     }
     return ['command' => $command, 'location' => $location, 'options' => $options];
+}
+
+function longOptionRequiresValue(string $option): bool {
+    return in_array($option, [
+        'url',
+        'max-examples',
+        'phases',
+        'checks',
+        'exclude-checks',
+        'max-failures',
+        'request-timeout',
+        'seed',
+        'auth'
+    ], true);
 }
 
 function csvOption(array $options, string $name, array $default): array {

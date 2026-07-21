@@ -261,6 +261,13 @@ function printUsage(): void {
     echo "  --benchmark-baseline FILE      Compare benchmark result to a prior JSON result\n";
     echo "  --pro-path FILE                Load a private Pro extension file\n";
     echo "  --license-key KEY              Pass a license key to a Pro extension\n";
+    echo "  --pro-output-dir DIRECTORY     Pro extension output directory\n";
+    echo "  --pro-project NAME             Pro project/baseline name\n";
+    echo "  --pro-customer NAME            Pro customer/audit label\n";
+    echo "  --pro-rules LIST               Pro rule packs to apply\n";
+    echo "  --pro-plan NAME                Pro license plan for private license issuing\n";
+    echo "  --gumroad-key KEY              Gumroad license key for Pro activation\n";
+    echo "  --gumroad-product-id ID        Gumroad product id for Pro activation\n";
     echo "  --fail-on-regression           Exit non-zero on unexpected benchmark failures\n";
     echo "  --seed N                       Reproducible random seed\n";
     echo "  --no-interaction               Write init defaults without prompting\n";
@@ -277,6 +284,9 @@ function withResolvedProLicense(array $options): array {
 function proLicenseToken(array $options): string {
     $optionToken = optionString($options, 'license-key', '');
     if ($optionToken !== '') return $optionToken;
+
+    $gumroadToken = optionString($options, 'gumroad-key', '');
+    if ($gumroadToken !== '') return $gumroadToken;
 
     $envToken = getenv(PRO_LICENSE_ENV);
     if (is_string($envToken) && trim($envToken) !== '') return trim($envToken);
@@ -330,6 +340,7 @@ function runProCommand(?string $action, array $options, ?callable $extension): i
         echo "Community features are active. Pro features are locked.\n\n";
         echo "Unlock Pro with:\n";
         echo "  php bin/openapi-contract pro status --license-key YOUR_TOKEN\n";
+        echo "  php bin/openapi-contract pro activate --gumroad-product-id PRODUCT_ID --gumroad-key GUMROAD_LICENSE_KEY\n";
         echo "  " . PRO_LICENSE_ENV . "=YOUR_TOKEN php bin/openapi-contract pro status\n";
         echo "  mkdir -p .openapi-contract && printf '%s' YOUR_TOKEN > .openapi-contract/license.key\n";
         return 3;
@@ -680,7 +691,7 @@ function benchmarkCaseOptions(array $case, array $suite, array $globalOptions, s
     $options = [];
     foreach (($suite['defaults'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
     foreach (($case['options'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
-    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'auth', 'auth-token', 'pro-path', 'license-key'] as $key) {
+    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'report', 'auth', 'auth-token', 'pro-path', 'license-key', 'pro-output-dir', 'pro-project', 'pro-customer', 'pro-rules', 'pro-plan', 'gumroad-key', 'gumroad-product-id'] as $key) {
         if (array_key_exists($key, $globalOptions)) $options[$key] = $globalOptions[$key];
     }
     if (isset($globalOptions['auth-api-key'])) $options['auth-api-key'] = $globalOptions['auth-api-key'];
@@ -1170,6 +1181,15 @@ function longOptionRequiresValue(string $option): bool {
         'benchmark-baseline',
         'pro-path',
         'license-key',
+        'pro-output-dir',
+        'pro-project',
+        'pro-customer',
+        'pro-rules',
+        'pro-plan',
+        'pro-expires',
+        'pro-phar',
+        'gumroad-key',
+        'gumroad-product-id',
         'report-junit-path',
         'report-vcr-path',
         'report-har-path',

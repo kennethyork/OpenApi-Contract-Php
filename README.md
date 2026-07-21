@@ -89,11 +89,19 @@ Paid users keep the same commands and pass a license token:
 
 ```bash
 php bin/openapi-contract run ./openapi.json --url http://127.0.0.1:8080 \
-  --report html --license-key YOUR_TOKEN
+  --license-key YOUR_TOKEN --pro-output-dir pro-report
 ```
 
 The token can also come from `OPENAPI_CONTRACT_PRO_TOKEN` or
-`.openapi-contract/license.key`.
+`.openapi-contract/license.key`. If you sell Pro through Gumroad, activate a
+buyer key once and then use the same CLI normally:
+
+```bash
+php bin/openapi-contract pro activate \
+  --pro-path pro/openapi-contract-pro.php \
+  --gumroad-product-id PRODUCT_ID \
+  --gumroad-key GUMROAD_LICENSE_KEY
+```
 
 ```bash
 php bin/openapi-contract run https://api.example.com/openapi.json --phases examples,coverage,fuzzing --max-examples 5

@@ -1,10 +1,12 @@
-# Pro Edition Plan
+# Pro Edition
 
 This repository is the Community edition: a vanilla PHP CLI for local API
 contract testing. It is MIT licensed and should stay useful on its own.
 
-The Pro edition should live outside this public repository as a private
-extension, licensed separately.
+The Pro edition lives outside this public repository as a private extension,
+licensed separately. A local development copy can sit at
+`pro/openapi-contract-pro.php`; that path is ignored by git so paid code is not
+published with the Community repo.
 
 ## Same CLI Model
 
@@ -43,6 +45,7 @@ Pro edition:
 - organization rule packs
 - custom checks and serializers
 - Laravel/PHP framework presets
+- Gumroad license activation
 - license status command
 - signed PHAR builds
 - priority support
@@ -132,6 +135,87 @@ php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
 ```
 
 Do not commit license keys to the public repository.
+
+## Gumroad Sales Flow
+
+Gumroad works for a first paid version because it can sell a digital product and
+issue software license keys. Gumroad's license verification API checks a
+`product_id`, a `license_key`, and an optional `increment_uses_count` flag. For
+products created on or after January 9, 2023, Gumroad requires `product_id`
+rather than `product_permalink` for verification.
+
+Recommended setup:
+
+1. Create a Gumroad product for the private Pro extension or PHAR.
+2. Add Gumroad's license key block to the product content.
+3. Put the private Pro file or PHAR in the paid download.
+4. Tell buyers to activate once:
+
+```bash
+php bin/openapi-contract pro activate \
+  --pro-path pro/openapi-contract-pro.php \
+  --gumroad-product-id PRODUCT_ID \
+  --gumroad-key GUMROAD_LICENSE_KEY
+```
+
+Activation verifies the Gumroad key, checks for refunds, disputes,
+chargebacks, and ended/cancelled/failed subscriptions, then writes the ignored
+local license files:
+
+```text
+.openapi-contract/license.key
+.openapi-contract/gumroad-product.id
+```
+
+After activation, paid users run the same commands as free users:
+
+```bash
+php bin/openapi-contract run openapi.json --url http://127.0.0.1:8080
+php bin/openapi-contract benchmark tests/benchmarks/local.json
+```
+
+Direct Gumroad verification is the simplest first version, but Gumroad-backed
+keys need network access when the private extension validates them. A later
+hosted license service can exchange a Gumroad purchase for your own signed
+offline token.
+
+For a one-off command without writing local activation files:
+
+```bash
+php bin/openapi-contract pro status \
+  --pro-path pro/openapi-contract-pro.php \
+  --gumroad-product-id PRODUCT_ID \
+  --gumroad-key GUMROAD_LICENSE_KEY
+```
+
+The official Gumroad license key documentation is here:
+https://gumroad.com/help/article/76-license-keys
+
+## Private Extension Commands
+
+The local private Pro extension implements these commands:
+
+- `status`
+- `features`
+- `activate`
+- `issue-license`
+- `verify-license`
+- `baselines`
+- `trend`
+- `laravel-preset`
+- `private-corpus`
+- `phar`
+
+It also adds paid run and benchmark hooks that can write:
+
+- `audit.json`
+- `audit.html`
+- `audit.pdf`
+- `remediation.md`
+- `benchmark-dashboard.json`
+- `benchmark-dashboard.html`
+- `benchmark-dashboard.pdf`
+- `trend.html`
 
 ## Pricing Starting Point
 

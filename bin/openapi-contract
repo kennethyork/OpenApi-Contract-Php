@@ -18,8 +18,8 @@ declare(strict_types=1);
  * - unsupported_method
  *
  * Full feature coverage still requires a property-based testing engine,
- * shrinking, replay storage, stateful links, reports, GraphQL support, and a
- * much larger OpenAPI implementation.
+ * shrinking, link-aware stateful workflows, GraphQL support, and a much larger
+ * OpenAPI implementation.
  */
 
 const DEFAULT_CHECKS = [
@@ -46,8 +46,19 @@ const KNOWN_CHECKS = [
     'unsupported_method'
 ];
 
-const IMPLEMENTED_CHECKS = DEFAULT_CHECKS;
+const IMPLEMENTED_CHECKS = [
+    'not_a_server_error',
+    'status_code_conformance',
+    'content_type_conformance',
+    'response_headers_conformance',
+    'response_schema_conformance',
+    'negative_data_rejection',
+    'positive_data_acceptance',
+    'unsupported_method'
+];
 const HTTP_OPERATION_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
+const DEFAULT_CACHE_DIR = '.openapi-contract/cache';
+const DEFAULT_REPORT_DIR = 'openapi-contract-report';
 
 main($argv);
 
@@ -59,18 +70,45 @@ function main(array $argv): void {
 
     $parsed = parseCli($argv);
     $command = $parsed['command'] ?? null;
-    if (!in_array($command, ['run', 'fuzz'], true) || empty($parsed['location'])) {
-        printUsage();
-        exit(2);
+
+    if ($command === 'init') {
+        exit(runInitCommand($parsed['location'], $parsed['options']));
     }
 
-    $options = $parsed['options'];
-    $location = $parsed['location'];
+    if ($command === 'interactive') {
+        exit(runInteractiveCommand($parsed['location'], $parsed['options']));
+    }
+
+    $options = mergeConfigOptions($parsed['options']);
+    if ($command === 'doctor') {
+        exit(runDoctorCommand($parsed['location'], $options));
+    }
+
+    if ($command === 'replay') {
+        exit(runReplayCommand($parsed['location'], $options));
+    }
+
+    exit(runTestCommand((string)$command, $parsed['location'], $options));
+}
+
+function runTestCommand(string $command, ?string $providedLocation, array $options): int {
+    if (!in_array($command, ['run', 'fuzz'], true)) {
+        printUsage();
+        return 2;
+    }
+
+    $location = schemaLocationFromOptions($providedLocation, $options);
+    if ($location === null) {
+        fwrite(STDERR, "No OpenAPI schema location provided. Pass LOCATION or set schema-location in config.\n");
+        return 2;
+    }
+
     $phases = $command === 'fuzz' ? ['fuzzing'] : csvOption($options, 'phases', ['examples', 'coverage', 'fuzzing']);
     $maxTime = isset($options['max-time']) ? max(1.0, (float)$options['max-time']) : null;
     $maxExamplesDefault = $command === 'fuzz' ? ($maxTime === null ? 100 : PHP_INT_MAX) : 5;
     $maxExamples = max(1, (int)($options['max-examples'] ?? $maxExamplesDefault));
     $maxFailures = isset($options['max-failures']) ? max(1, (int)$options['max-failures']) : null;
+    $mode = in_array(($options['mode'] ?? 'positive'), ['positive', 'negative', 'all'], true) ? (string)($options['mode'] ?? 'positive') : 'positive';
     $timeout = isset($options['request-timeout']) ? max(1.0, (float)$options['request-timeout']) : 10.0;
     $headers = headersFromOptions($options);
     $checks = selectedChecks($options);
@@ -86,7 +124,7 @@ function main(array $argv): void {
         $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
     } catch (Throwable $e) {
         echo " FAIL Could not load specification: {$e->getMessage()}\n";
-        exit(1);
+        return 1;
     }
 
     $warnings = [];
@@ -108,13 +146,18 @@ function main(array $argv): void {
         'timeout' => $timeout,
         'transport' => $transport,
         'max_response_time' => isset($options['max-response-time']) ? max(PHP_FLOAT_EPSILON, (float)$options['max-response-time']) : null,
+        'mode' => $mode,
         'max_failures' => $maxFailures,
         'failures' => [],
         'warnings' => $warnings,
         'cases' => 0,
+        'case_records' => [],
         'total_operations' => count($allOperations),
         'seed' => $seed,
-        'last_request_at' => null
+        'last_request_at' => null,
+        'schema_location' => $location,
+        'report' => reportOptionsFromOptions($options),
+        'cache_dir' => (string)($options['cache-dir'] ?? DEFAULT_CACHE_DIR)
     ];
 
     $phaseResults = [];
@@ -127,7 +170,7 @@ function main(array $argv): void {
             'examples' => runExamplesPhase($operations, $state),
             'coverage' => runCoveragePhase($operations, $state),
             'fuzzing' => runFuzzingPhase($operations, $state, $maxExamples, $deadline),
-            'stateful' => ['passed' => 0, 'failed' => 0, 'skipped' => count($operations), 'label' => 'Stateful', 'unsupported' => true],
+            'stateful' => runStatefulPhase($operations, $state, $maxExamples, $deadline),
             default => ['passed' => 0, 'failed' => 0, 'skipped' => count($operations), 'label' => ucfirst($phase), 'unsupported' => true]
         };
         $result['duration'] = microtime(true) - $started;
@@ -138,14 +181,21 @@ function main(array $argv): void {
     printFailures($state);
     printWarnings($state);
     printSummary($operations, $phaseResults, $state);
-    exit($state['failures'] ? 1 : 0);
+    writeReports($state, $phaseResults);
+    return $state['failures'] ? 1 : 0;
 }
 
 function printUsage(): void {
     echo "Usage:\n";
-    echo "  php bin/openapi-contract run [OPTIONS] LOCATION\n";
-    echo "  php bin/openapi-contract fuzz [OPTIONS] LOCATION\n\n";
+    echo "  php bin/openapi-contract init [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract interactive [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract doctor [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract run [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract fuzz [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract replay [OPTIONS] [PATH|CASE_ID]\n\n";
     echo "Options:\n";
+    echo "  --config FILE                  Load JSON config defaults, or init target file\n";
+    echo "  --schema-location LOCATION     OpenAPI schema location for config-backed runs\n";
     echo "  -u, --url URL                  API base URL for file-based schemas\n";
     echo "  -w, --workers N|auto           Worker count (currently sequential)\n";
     echo "  -H, --header NAME:VALUE        Add a custom HTTP header\n";
@@ -167,8 +217,482 @@ function printUsage(): void {
     echo "  --max-redirects N              Follow up to N redirects\n";
     echo "  --proxy URL                    HTTP proxy URL\n";
     echo "  --tls-verify true|false|PATH   TLS verification setting\n";
+    echo "  --report FORMAT                junit,har,ndjson,vcr\n";
+    echo "  --report-dir DIRECTORY         Directory for generated reports\n";
+    echo "  --report-junit-path FILE       JUnit XML output path\n";
+    echo "  --report-har-path FILE         HAR output path\n";
+    echo "  --report-ndjson-path FILE      NDJSON events output path\n";
+    echo "  --report-vcr-path FILE         Request/response cassette path\n";
+    echo "  --cache-dir DIRECTORY          Crash/replay cache directory\n";
     echo "  --seed N                       Reproducible random seed\n";
+    echo "  --no-interaction               Write init defaults without prompting\n";
+    echo "  --force                        Allow init to overwrite an existing config\n";
     echo "  --no-color                     Accepted for CLI compatibility\n";
+}
+
+function runInitCommand(?string $target, array $options): int {
+    $interactive = !truthyOption($options['no-interaction'] ?? false);
+    $configPath = optionString($options, 'config', 'openapi-contract.json');
+    $schemaLocation = optionString($options, 'schema-location', $target ?? 'openapi.json');
+    $baseUrl = optionString($options, 'url', guessBaseUrl($schemaLocation));
+    $phases = optionString($options, 'phases', 'examples,coverage,fuzzing');
+    $checks = optionString($options, 'checks', '');
+    $maxExamples = optionString($options, 'max-examples', '25');
+    $requestTimeout = optionString($options, 'request-timeout', '10');
+    $requestRetries = optionString($options, 'request-retries', '0');
+    $maxRedirects = optionString($options, 'max-redirects', '0');
+    $auth = optionString($options, 'auth', '');
+    $headers = optionValues($options, 'header');
+    $reports = csvOption($options, 'report', ['ndjson', 'junit']);
+    $reportDir = optionString($options, 'report-dir', DEFAULT_REPORT_DIR);
+    $cacheDir = optionString($options, 'cache-dir', DEFAULT_CACHE_DIR);
+
+    if ($interactive) {
+        echo "openapi-contract-php init\n";
+        echo str_repeat("-", 25) . "\n\n";
+        if (!truthyOption($options['fixed-config'] ?? false)) {
+            $configPath = promptText('Config file', $configPath);
+        }
+        $schemaLocation = promptText('OpenAPI schema location', $schemaLocation);
+        $guessedUrl = $baseUrl !== '' ? $baseUrl : guessBaseUrl($schemaLocation);
+        $baseUrl = promptText('API base URL', $guessedUrl);
+        $phases = promptText('Phases', $phases);
+        $checks = promptText('Checks, empty for default', $checks);
+        $maxExamples = promptText('Max fuzz examples per operation', $maxExamples);
+        $requestTimeout = promptText('Request timeout seconds', $requestTimeout);
+        $requestRetries = promptText('Request retries', $requestRetries);
+        $maxRedirects = promptText('Max redirects', $maxRedirects);
+        $auth = promptText('Basic auth USER:PASS, empty for none', $auth);
+        $headerText = promptText('Extra headers, comma-separated NAME: VALUE', implode(', ', $headers));
+        $headers = parseHeaderInput($headerText);
+        $reportText = promptText('Reports, comma-separated or none', implode(',', $reports));
+        $reports = csvList($reportText);
+        $reportDir = promptText('Report directory', $reportDir);
+        $cacheDir = promptText('Crash/replay cache directory', $cacheDir);
+    }
+
+    if (trim($schemaLocation) === '') {
+        fwrite(STDERR, "Schema location is required.\n");
+        return 2;
+    }
+
+    if (is_file($configPath) && !truthyOption($options['force'] ?? false)) {
+        if (!$interactive || !promptYesNo("Overwrite existing {$configPath}?", false)) {
+            fwrite(STDERR, "Config file already exists: {$configPath}\n");
+            return 2;
+        }
+    }
+
+    $config = [
+        'schema-location' => $schemaLocation,
+        'phases' => $phases,
+        'max-examples' => max(1, (int)$maxExamples),
+        'request-timeout' => max(1.0, (float)$requestTimeout),
+        'request-retries' => max(0, (int)$requestRetries),
+        'max-redirects' => max(0, (int)$maxRedirects),
+        'cache-dir' => $cacheDir
+    ];
+
+    if (trim($baseUrl) !== '') $config['url'] = trim($baseUrl);
+    if (trim($checks) !== '') $config['checks'] = trim($checks);
+    if ($headers) $config['headers'] = array_values($headers);
+    if (trim($auth) !== '') {
+        [$username, $password] = array_pad(explode(':', $auth, 2), 2, '');
+        $config['auth'] = ['basic' => ['username' => $username, 'password' => $password]];
+    }
+    $reports = array_values(array_intersect($reports, ['junit', 'har', 'ndjson', 'vcr']));
+    if ($reports) {
+        $config['reports'] = ['directory' => $reportDir];
+        foreach ($reports as $format) {
+            $config['reports'][$format] = ['enabled' => true];
+        }
+    }
+
+    $dir = dirname($configPath);
+    if ($dir !== '.' && !is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+        fwrite(STDERR, "Could not create config directory: {$dir}\n");
+        return 1;
+    }
+
+    $json = json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false || file_put_contents($configPath, $json . "\n") === false) {
+        fwrite(STDERR, "Could not write config file: {$configPath}\n");
+        return 1;
+    }
+
+    echo "Wrote {$configPath}\n";
+    echo "Run: php bin/openapi-contract doctor --config {$configPath}\n";
+    echo "Run: php bin/openapi-contract run --config {$configPath}\n";
+    return 0;
+}
+
+function runInteractiveCommand(?string $target, array $options): int {
+    echo "openapi-contract-php interactive\n";
+    echo str_repeat("-", 32) . "\n\n";
+
+    $configPath = optionString($options, 'config', defaultConfigPath());
+    $configPath = promptText('Config file', $configPath);
+    $options['config'] = $configPath;
+
+    if (!is_file($configPath)) {
+        echo "\nNo config file found at {$configPath}.\n";
+        if (promptYesNo('Create it now?', true)) {
+            $initOptions = $options;
+            $initOptions['fixed-config'] = true;
+            $initCode = runInitCommand($target, $initOptions);
+            if ($initCode !== 0) return $initCode;
+        } else {
+            unset($options['config']);
+        }
+    } elseif (promptYesNo('Update config now?', false)) {
+        $initOptions = $options;
+        $initOptions['fixed-config'] = true;
+        $initCode = runInitCommand($target, $initOptions);
+        if ($initCode !== 0) return $initCode;
+    }
+
+    $lastExitCode = 0;
+    while (true) {
+        echo "\nActions:\n";
+        echo "  1. Doctor\n";
+        echo "  2. Run\n";
+        echo "  3. Fuzz\n";
+        echo "  4. Replay\n";
+        echo "  5. Init\n";
+        echo "  6. Quit\n";
+        $choice = strtolower(promptText('Choose action', '2'));
+
+        if (in_array($choice, ['6', 'q', 'quit', 'exit'], true)) {
+            return $lastExitCode;
+        }
+
+        try {
+            $mergedOptions = mergeConfigOptions($options);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "Could not load config: {$e->getMessage()}\n");
+            return 2;
+        }
+
+        switch ($choice) {
+            case '1':
+            case 'doctor':
+                $doctorLocation = schemaLocationFromOptions($target, $mergedOptions);
+                $doctorLocation = promptText('OpenAPI schema location', $doctorLocation ?? '');
+                $lastExitCode = runDoctorCommand($doctorLocation, promptUrlOption($mergedOptions, $doctorLocation));
+                break;
+
+            case '2':
+            case 'run':
+                $runLocation = schemaLocationFromOptions($target, $mergedOptions);
+                $runOptions = promptRunOptions($mergedOptions, 'run', $runLocation);
+                $lastExitCode = runTestCommand('run', $runLocation, $runOptions);
+                break;
+
+            case '3':
+            case 'fuzz':
+                $fuzzLocation = schemaLocationFromOptions($target, $mergedOptions);
+                $fuzzOptions = promptRunOptions($mergedOptions, 'fuzz', $fuzzLocation);
+                $lastExitCode = runTestCommand('fuzz', $fuzzLocation, $fuzzOptions);
+                break;
+
+            case '4':
+            case 'replay':
+                $replayTarget = promptText('Crash path or case id, empty for all', '');
+                $lastExitCode = runReplayCommand($replayTarget === '' ? null : $replayTarget, $mergedOptions);
+                break;
+
+            case '5':
+            case 'init':
+                $initOptions = $options;
+                $initOptions['fixed-config'] = isset($options['config']);
+                $lastExitCode = runInitCommand($target, $initOptions);
+                break;
+
+            default:
+                echo "Unknown action: {$choice}\n";
+                $lastExitCode = 2;
+                break;
+        }
+
+        if (!promptYesNo('Choose another action?', false)) return $lastExitCode;
+    }
+}
+
+function defaultConfigPath(): string {
+    foreach (['openapi-contract.json', '.openapi-contract.json'] as $candidate) {
+        if (is_file($candidate)) return $candidate;
+    }
+    return 'openapi-contract.json';
+}
+
+function promptUrlOption(array $options, ?string $location): array {
+    $defaultUrl = optionString($options, 'url', $location === null ? '' : guessBaseUrl($location));
+    $url = promptText('API base URL', $defaultUrl);
+    if ($url !== '') $options['url'] = $url;
+    return $options;
+}
+
+function promptRunOptions(array $options, string $command, ?string &$location): array {
+    $location = promptText('OpenAPI schema location', $location ?? 'openapi.json');
+    $options = promptUrlOption($options, $location);
+
+    if ($command === 'run') {
+        $options['phases'] = promptText('Phases', optionString($options, 'phases', 'examples,coverage,fuzzing'));
+    } else {
+        $mode = promptText('Mode', optionString($options, 'mode', 'positive'));
+        $options['mode'] = in_array($mode, ['positive', 'negative', 'all'], true) ? $mode : 'positive';
+    }
+
+    $defaultExamples = $command === 'fuzz' ? '100' : '5';
+    $options['max-examples'] = promptText('Max examples per operation', optionString($options, 'max-examples', $defaultExamples));
+    $reports = promptText('Reports, comma-separated or none', implode(',', csvOption($options, 'report', [])));
+    if ($reports === '') unset($options['report']);
+    else $options['report'] = csvList($reports);
+    return $options;
+}
+
+function runDoctorCommand(?string $target, array $options): int {
+    $failures = 0;
+    $warnings = [];
+    $timeout = isset($options['request-timeout']) ? max(1.0, (float)$options['request-timeout']) : 10.0;
+    $transport = transportOptionsFromOptions($options);
+    $location = schemaLocationFromOptions($target, $options);
+
+    echo "openapi-contract-php doctor\n";
+    echo str_repeat("-", 27) . "\n\n";
+
+    if (PHP_VERSION_ID >= 80200) {
+        doctorLine('OK', 'PHP', PHP_VERSION);
+    } else {
+        doctorLine('FAIL', 'PHP', 'PHP 8.2 or newer is required; current version is ' . PHP_VERSION);
+        $failures++;
+    }
+
+    foreach (['json', 'curl'] as $extension) {
+        if (extension_loaded($extension)) {
+            doctorLine('OK', "Extension {$extension}", 'loaded');
+        } else {
+            doctorLine('FAIL', "Extension {$extension}", 'missing');
+            $failures++;
+        }
+    }
+
+    if (isset($options['config'])) {
+        doctorLine('OK', 'Config', (string)$options['config']);
+    } else {
+        doctorLine('WARN', 'Config', 'no config file loaded');
+        $warnings[] = 'No config file was found; run init to create one.';
+    }
+
+    if ($location === null) {
+        doctorLine('FAIL', 'Schema', 'no location provided');
+        $failures++;
+    } else {
+        $isYaml = (bool)preg_match('/\.(ya?ml)$/i', parse_url($location, PHP_URL_PATH) ?? $location);
+        if ($isYaml && !function_exists('yaml_parse')) {
+            doctorLine('WARN', 'YAML parser', 'php-yaml is not loaded; using the built-in limited YAML parser');
+            $warnings[] = 'Complex YAML features may require the php-yaml extension.';
+        }
+
+        try {
+            $schema = loadSchema($location, $timeout, isset($options['wait-for-schema']) ? (float)$options['wait-for-schema'] : 0.0, $transport);
+            doctorLine('OK', 'Schema', $location);
+            doctorLine('OK', 'OpenAPI', (string)($schema['openapi'] ?? 'unknown'));
+
+            $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
+            if (preg_match('#^https?://#', $baseUrl)) {
+                doctorLine('OK', 'Base URL', $baseUrl);
+            } else {
+                doctorLine('FAIL', 'Base URL', "{$baseUrl} is not an absolute HTTP URL");
+                $failures++;
+            }
+
+            $allOperations = collectOperations($schema);
+            $selectedOperations = filterOperations($allOperations, $options, $warnings);
+            if ($selectedOperations) {
+                doctorLine('OK', 'Operations', count($selectedOperations) . ' selected / ' . count($allOperations) . ' total');
+            } else {
+                doctorLine('FAIL', 'Operations', 'no operations selected');
+                $failures++;
+            }
+
+            $phases = csvOption($options, 'phases', ['examples', 'coverage', 'fuzzing']);
+            $checks = selectedChecks($options);
+            addCompatibilityWarnings($options, $phases, $checks, 'run', $schema, $warnings);
+            doctorLine('OK', 'Phases', implode(',', $phases));
+            doctorLine('OK', 'Checks', implode(',', $checks));
+
+            $report = reportOptionsFromOptions($options);
+            doctorLine('OK', 'Reports', ($report['formats'] ?? []) ? implode(',', $report['formats']) : 'disabled');
+            doctorLine('OK', 'Cache', (string)($options['cache-dir'] ?? DEFAULT_CACHE_DIR));
+        } catch (Throwable $e) {
+            doctorLine('FAIL', 'Schema', $e->getMessage());
+            $failures++;
+        }
+    }
+
+    foreach (array_values(array_unique($warnings)) as $warning) {
+        doctorLine('WARN', 'Note', $warning);
+    }
+
+    echo "\n";
+    echo $failures ? "Doctor found {$failures} blocking issue(s).\n" : "Doctor found no blocking issues.\n";
+    return $failures ? 1 : 0;
+}
+
+function schemaLocationFromOptions(?string $location, array $options): ?string {
+    foreach ([$location, $options['schema-location'] ?? null, $options['schema'] ?? null, $options['location'] ?? null] as $candidate) {
+        if ($candidate === null || $candidate === true) continue;
+        $value = trim((string)$candidate);
+        if ($value !== '') return $value;
+    }
+    return null;
+}
+
+function optionString(array $options, string $name, string $default = ''): string {
+    if (!array_key_exists($name, $options) || $options[$name] === true || $options[$name] === null) return $default;
+    $value = $options[$name];
+    if (is_array($value)) return implode(',', array_map('strval', $value));
+    return trim((string)$value);
+}
+
+function truthyOption($value): bool {
+    if ($value === true) return true;
+    if ($value === false || $value === null) return false;
+    return !in_array(strtolower(trim((string)$value)), ['', '0', 'false', 'no', 'off'], true);
+}
+
+function promptText(string $label, string $default = ''): string {
+    $suffix = $default === '' ? '' : " [{$default}]";
+    fwrite(STDOUT, "{$label}{$suffix}: ");
+    $line = fgets(STDIN);
+    if ($line === false) return $default;
+    $value = trim($line);
+    return $value === '' ? $default : $value;
+}
+
+function promptYesNo(string $label, bool $default): bool {
+    $suffix = $default ? 'Y/n' : 'y/N';
+    while (true) {
+        fwrite(STDOUT, "{$label} [{$suffix}]: ");
+        $line = fgets(STDIN);
+        if ($line === false) return $default;
+        $value = strtolower(trim($line));
+        if ($value === '') return $default;
+        if (in_array($value, ['y', 'yes'], true)) return true;
+        if (in_array($value, ['n', 'no'], true)) return false;
+    }
+}
+
+function parseHeaderInput(string $value): array {
+    $headers = [];
+    foreach (explode(',', $value) as $header) {
+        $header = trim($header);
+        if ($header !== '' && str_contains($header, ':')) $headers[] = $header;
+    }
+    return $headers;
+}
+
+function csvList(string $value): array {
+    return array_values(array_filter(array_map('trim', explode(',', $value)), fn(string $item) => $item !== ''));
+}
+
+function guessBaseUrl(string $schemaLocation): string {
+    if (trim($schemaLocation) === '') return '';
+    try {
+        $schema = loadSchemaOnce($schemaLocation, 3.0, []);
+        return isset($schema['servers'][0]['url']) ? rtrim((string)$schema['servers'][0]['url'], '/') : '';
+    } catch (Throwable) {
+        return '';
+    }
+}
+
+function doctorLine(string $status, string $label, string $detail): void {
+    printf(" %-4s %-20s %s\n", $status, $label . ':', $detail);
+}
+
+function runReplayCommand(?string $target, array $options): int {
+    $cacheDir = (string)($options['cache-dir'] ?? DEFAULT_CACHE_DIR);
+    $crashes = resolveReplayTargets($target, $cacheDir);
+    if (!$crashes) {
+        fwrite(STDERR, "No crash files found to replay.\n");
+        return 2;
+    }
+
+    $timeout = isset($options['request-timeout']) ? max(1.0, (float)$options['request-timeout']) : 10.0;
+    $transport = transportOptionsFromOptions($options);
+    $failures = [];
+    $passed = 0;
+
+    echo "openapi-contract-php replay\n";
+    echo str_repeat("-", 27) . "\n\n";
+
+    foreach ($crashes as $path) {
+        $crash = json_decode((string)file_get_contents($path), true);
+        if (!is_array($crash)) {
+            $failures[] = "{$path}: invalid crash file";
+            continue;
+        }
+
+        $request = $crash['request'] ?? [];
+        $method = (string)($request['method'] ?? 'GET');
+        $url = replayUrl($crash, $options);
+        $headers = array_map('strval', $request['headers'] ?? []);
+        $body = array_key_exists('body', $request) && $request['body'] !== null ? (string)$request['body'] : null;
+
+        try {
+            $response = httpRequest($method, $url, $headers, $body, $timeout, $transport);
+            $failure = null;
+            if (isset($crash['operation'], $crash['components'], $crash['checks']) && is_array($crash['operation'])) {
+                $failure = validateResponse(
+                    ['operation' => $crash['operation'], 'path' => $crash['operation_path'] ?? $request['path_query'] ?? '', 'method' => $method],
+                    $response,
+                    is_array($crash['components']) ? $crash['components'] : [],
+                    is_array($crash['checks']) ? $crash['checks'] : DEFAULT_CHECKS,
+                    $crash['max_response_time'] ?? null,
+                    (string)($request['mode'] ?? 'positive')
+                );
+            }
+            if ($failure === null) {
+                echo " OK   {$crash['id']} {$method} {$url}\n";
+                $passed++;
+                if (!($options['keep'] ?? false)) @unlink($path);
+            } else {
+                echo " FAIL {$crash['id']} {$method} {$url}: {$failure}\n";
+                $failures[] = "{$crash['id']}: {$failure}";
+            }
+        } catch (Throwable $e) {
+            echo " FAIL {$crash['id']} {$method} {$url}: {$e->getMessage()}\n";
+            $failures[] = "{$crash['id']}: {$e->getMessage()}";
+        }
+    }
+
+    echo "\n=================================== SUMMARY ====================================\n";
+    echo "Replayed: " . count($crashes) . "\n";
+    echo "Passed: {$passed}\n";
+    echo "Failed: " . count($failures) . "\n";
+    return $failures ? 1 : 0;
+}
+
+function resolveReplayTargets(?string $target, string $cacheDir): array {
+    $crashDir = rtrim($cacheDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crashes';
+    if ($target === null || $target === '') {
+        return array_values(array_filter(glob($crashDir . DIRECTORY_SEPARATOR . '*.json') ?: [], 'is_file'));
+    }
+    if (is_file($target)) return [$target];
+    if (is_dir($target)) return array_values(array_filter(glob(rtrim($target, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '*.json') ?: [], 'is_file'));
+    $candidate = $crashDir . DIRECTORY_SEPARATOR . $target . '.json';
+    if (is_file($candidate)) return [$candidate];
+    $matches = glob($crashDir . DIRECTORY_SEPARATOR . $target . '*.json') ?: [];
+    return array_values(array_filter($matches, 'is_file'));
+}
+
+function replayUrl(array $crash, array $options): string {
+    if (!isset($options['url']) || trim((string)$options['url']) === '') {
+        return (string)($crash['request']['url'] ?? '');
+    }
+    $pathQuery = (string)($crash['request']['path_query'] ?? parse_url((string)($crash['request']['url'] ?? ''), PHP_URL_PATH) ?? '/');
+    return rtrim((string)$options['url'], '/') . $pathQuery;
 }
 
 function parseCli(array $argv): array {
@@ -231,6 +755,7 @@ function parseCli(array $argv): array {
 
 function longOptionRequiresValue(string $option): bool {
     return in_array($option, [
+        'config',
         'url',
         'workers',
         'max-examples',
@@ -271,6 +796,7 @@ function longOptionRequiresValue(string $option): bool {
         'max-redirects',
         'report',
         'report-dir',
+        'cache-dir',
         'report-junit-path',
         'report-vcr-path',
         'report-har-path',
@@ -325,6 +851,124 @@ function appendOption(array &$options, string $name, string $value): void {
         $options[$name] = [$options[$name]];
     }
     $options[$name][] = $value;
+}
+
+function mergeConfigOptions(array $options): array {
+    $configPath = $options['config'] ?? null;
+    if ($configPath === null) {
+        foreach (['openapi-contract.json', '.openapi-contract.json'] as $candidate) {
+            if (is_file($candidate)) {
+                $configPath = $candidate;
+                break;
+            }
+        }
+    }
+    if ($configPath === null || $configPath === true || trim((string)$configPath) === '') return $options;
+    if (!is_file((string)$configPath)) {
+        fwrite(STDERR, "Config file not found: {$configPath}\n");
+        exit(2);
+    }
+
+    $json = file_get_contents((string)$configPath);
+    $config = json_decode((string)$json, true);
+    if (!is_array($config)) {
+        fwrite(STDERR, "Config file is not valid JSON: {$configPath}\n");
+        exit(2);
+    }
+
+    $defaults = flattenConfigOptions($config);
+    foreach ($options as $key => $value) {
+        if ($key === 'config') continue;
+        $defaults[$key] = mergeOptionValue($defaults[$key] ?? null, $value);
+    }
+    $defaults['config'] = $configPath;
+    return $defaults;
+}
+
+function flattenConfigOptions(array $config): array {
+    $options = [];
+    foreach ($config as $key => $value) {
+        if ($key === 'headers' && is_array($value)) {
+            foreach ($value as $header) $options['header'][] = (string)$header;
+            continue;
+        }
+        if ($key === 'auth' && is_array($value) && isset($value['basic'])) {
+            $basic = $value['basic'];
+            if (is_array($basic) && isset($basic['username'], $basic['password'])) {
+                $options['auth'] = $basic['username'] . ':' . $basic['password'];
+            }
+            continue;
+        }
+        if ($key === 'reports' && is_array($value)) {
+            flattenReportConfig($value, $options);
+            continue;
+        }
+        if ($key === 'generation' && is_array($value)) {
+            foreach ($value as $generationKey => $generationValue) {
+                $options['generation-' . kebabCase((string)$generationKey)] = scalarConfigValue($generationValue);
+            }
+            continue;
+        }
+        if ($key === 'request' && is_array($value)) {
+            foreach ($value as $requestKey => $requestValue) {
+                $options['request-' . kebabCase((string)$requestKey)] = scalarConfigValue($requestValue);
+            }
+            continue;
+        }
+        $options[kebabCase((string)$key)] = scalarConfigValue($value);
+    }
+    return $options;
+}
+
+function flattenReportConfig(array $reports, array &$options): void {
+    if (isset($reports['directory'])) $options['report-dir'] = (string)$reports['directory'];
+    foreach (['junit', 'har', 'ndjson', 'vcr'] as $format) {
+        if (!isset($reports[$format]) || !is_array($reports[$format])) continue;
+        if (($reports[$format]['enabled'] ?? false) || isset($reports[$format]['path'])) {
+            appendOption($options, 'report', $format);
+        }
+        if (isset($reports[$format]['path'])) {
+            $options["report-{$format}-path"] = (string)$reports[$format]['path'];
+        }
+    }
+}
+
+function scalarConfigValue($value) {
+    if (is_array($value)) return $value;
+    if (is_bool($value)) return $value ? 'true' : 'false';
+    return $value;
+}
+
+function kebabCase(string $value): string {
+    return strtolower(str_replace('_', '-', $value));
+}
+
+function mergeOptionValue($default, $override) {
+    if ($default === null) return $override;
+    if (is_array($default) || is_array($override)) {
+        return array_merge((array)$default, (array)$override);
+    }
+    return $override;
+}
+
+function reportOptionsFromOptions(array $options): array {
+    $formats = csvOption($options, 'report', []);
+    foreach (['junit', 'har', 'ndjson', 'vcr'] as $format) {
+        if (isset($options["report-{$format}-path"])) $formats[] = $format;
+    }
+    $formats = array_values(array_unique(array_filter($formats, fn(string $format) => in_array($format, ['junit', 'har', 'ndjson', 'vcr'], true))));
+    $dir = rtrim((string)($options['report-dir'] ?? DEFAULT_REPORT_DIR), DIRECTORY_SEPARATOR);
+    return [
+        'formats' => $formats,
+        'dir' => $dir,
+        'paths' => [
+            'junit' => $options['report-junit-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'junit.xml'),
+            'har' => $options['report-har-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'traffic.har'),
+            'ndjson' => $options['report-ndjson-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'events.ndjson'),
+            'vcr' => $options['report-vcr-path'] ?? ($dir . DIRECTORY_SEPARATOR . 'cassette.yaml')
+        ],
+        'preserve_bytes' => (bool)($options['report-preserve-bytes'] ?? false)
+    ];
 }
 
 function csvOption(array $options, string $name, array $default): array {
@@ -406,16 +1050,13 @@ function addCompatibilityWarnings(array $options, array $phases, array $checks, 
         $warnings[] = "Check '{$check}' is accepted but is not implemented yet.";
     }
     if (in_array('stateful', $phases, true)) {
-        $warnings[] = "Stateful testing is accepted in --phases but skipped until link/workflow execution is implemented.";
+        $warnings[] = "Stateful testing currently runs a linear workflow; link-based workflow extraction is not implemented yet.";
     }
     if (isset($options['workers']) && (string)$options['workers'] !== '1') {
         $warnings[] = "--workers is accepted but execution is currently sequential.";
     }
     if ($command === 'fuzz' && !isset($options['max-time']) && !isset($options['max-examples'])) {
         $warnings[] = "fuzz currently runs 100 examples per operation by default; pass --max-time for time-bounded fuzzing.";
-    }
-    if (($options['mode'] ?? 'positive') !== 'positive') {
-        $warnings[] = "--mode is accepted, but only positive data generation is implemented yet.";
     }
     if (($options['generation-deterministic'] ?? false) === true) {
         $warnings[] = "--generation-deterministic is accepted; use --seed for current reproducibility.";
@@ -425,12 +1066,7 @@ function addCompatibilityWarnings(array $options, array $phases, array $checks, 
         'generation-maximize' => 'targeted generation',
         'generation-database' => 'example database persistence',
         'generation-unique-inputs' => 'unique-input filtering',
-        'generation-graphql-allow-null' => 'GraphQL generation',
-        'report' => 'report generation',
-        'report-junit-path' => 'JUnit reporting',
-        'report-vcr-path' => 'VCR reporting',
-        'report-har-path' => 'HAR reporting',
-        'report-ndjson-path' => 'NDJSON reporting'
+        'generation-graphql-allow-null' => 'GraphQL generation'
     ] as $option => $feature) {
         if (isset($options[$option])) {
             $warnings[] = "--{$option} is accepted, but {$feature} is not implemented yet.";
@@ -469,9 +1105,116 @@ function loadSchemaOnce(string $location, float $timeout, array $transport = [])
         if (!is_file($location)) throw new RuntimeException("schema file not found: {$location}");
         $json = file_get_contents($location);
     }
-    $schema = json_decode((string)$json, true);
-    if (!is_array($schema)) throw new RuntimeException('schema is not valid JSON');
+    $schema = decodeSchemaDocument((string)$json, $location);
+    if (!is_array($schema)) throw new RuntimeException('schema is not a supported JSON or YAML object');
     return $schema;
+}
+
+function decodeSchemaDocument(string $document, string $location): array {
+    $json = json_decode($document, true);
+    if (is_array($json)) return $json;
+
+    if (function_exists('yaml_parse')) {
+        $yaml = @yaml_parse($document);
+        if (is_array($yaml)) return $yaml;
+    }
+
+    if (preg_match('/\.(ya?ml)$/i', parse_url($location, PHP_URL_PATH) ?? $location)) {
+        $yaml = parseSimpleYaml($document);
+        if (is_array($yaml)) return $yaml;
+    }
+
+    throw new RuntimeException('schema is not valid JSON and could not be parsed as YAML');
+}
+
+function parseSimpleYaml(string $document): array {
+    $lines = preg_split('/\r\n|\n|\r/', $document) ?: [];
+    $index = 0;
+    $parsed = parseYamlBlock($lines, $index, 0);
+    return is_array($parsed) ? $parsed : [];
+}
+
+function parseYamlBlock(array $lines, int &$index, int $indent) {
+    $result = [];
+    $isList = null;
+    $count = count($lines);
+
+    while ($index < $count) {
+        $raw = rtrim($lines[$index]);
+        if (trim($raw) === '' || str_starts_with(ltrim($raw), '#')) {
+            $index++;
+            continue;
+        }
+        $currentIndent = strlen($raw) - strlen(ltrim($raw, ' '));
+        if ($currentIndent < $indent) break;
+        if ($currentIndent > $indent) break;
+
+        $line = ltrim($raw);
+        if (str_starts_with($line, '- ')) {
+            if ($isList === false) break;
+            $isList = true;
+            $item = substr($line, 2);
+            $index++;
+            $result[] = parseYamlValueOrNested($item, $lines, $index, $indent + 2);
+            continue;
+        }
+
+        if ($isList === true || !str_contains($line, ':')) break;
+        $isList = false;
+        [$key, $value] = explode(':', $line, 2);
+        $index++;
+        $result[trim($key, "\"' ")] = parseYamlValueOrNested(ltrim($value), $lines, $index, $indent + 2);
+    }
+
+    return $result;
+}
+
+function parseYamlValueOrNested(string $value, array $lines, int &$index, int $indent) {
+    $value = stripYamlComment($value);
+    if ($value === '') return parseYamlBlock($lines, $index, $indent);
+    if (str_contains($value, ': ') && !str_starts_with($value, '"') && !str_starts_with($value, "'")) {
+        [$key, $nestedValue] = explode(':', $value, 2);
+        return [trim($key, "\"' ") => parseYamlScalar(trim($nestedValue))];
+    }
+    return parseYamlScalar($value);
+}
+
+function stripYamlComment(string $value): string {
+    $inSingle = false;
+    $inDouble = false;
+    $length = strlen($value);
+    for ($i = 0; $i < $length; $i++) {
+        $char = $value[$i];
+        if ($char === "'" && !$inDouble) $inSingle = !$inSingle;
+        elseif ($char === '"' && !$inSingle) $inDouble = !$inDouble;
+        elseif ($char === '#' && !$inSingle && !$inDouble && ($i === 0 || ctype_space($value[$i - 1]))) {
+            return trim(substr($value, 0, $i));
+        }
+    }
+    return trim($value);
+}
+
+function parseYamlScalar(string $value) {
+    $value = trim($value);
+    if ($value === 'null' || $value === '~') return null;
+    if ($value === 'true') return true;
+    if ($value === 'false') return false;
+    if (is_numeric($value)) return str_contains($value, '.') ? (float)$value : (int)$value;
+    if ((str_starts_with($value, '"') && str_ends_with($value, '"')) || (str_starts_with($value, "'") && str_ends_with($value, "'"))) {
+        return stripcslashes(substr($value, 1, -1));
+    }
+    if (str_starts_with($value, '[') && str_ends_with($value, ']')) {
+        $json = json_decode($value, true);
+        if (is_array($json)) return $json;
+        $inner = trim(substr($value, 1, -1));
+        if ($inner === '') return [];
+        return array_map(fn(string $item) => parseYamlScalar($item), array_map('trim', explode(',', $inner)));
+    }
+    if (str_starts_with($value, '{') && str_ends_with($value, '}')) {
+        $json = json_decode($value, true);
+        if (is_array($json)) return $json;
+    }
+    return $value;
 }
 
 function httpRequest(string $method, string $url, array $headers, ?string $body, float $timeout, array $transport = []): array {
@@ -673,11 +1416,44 @@ function runCoveragePhase(array $operations, array &$state): array {
 
 function runFuzzingPhase(array $operations, array &$state, int $maxExamples, ?float $deadline = null): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
+    $modes = match ($state['mode'] ?? 'positive') {
+        'negative' => ['negative'],
+        'all' => ['positive', 'negative'],
+        default => ['positive']
+    };
     foreach ($operations as $operation) {
         for ($i = 0; $i < $maxExamples; $i++) {
             if ($deadline !== null && microtime(true) >= $deadline) break 2;
-            runCase($operation, $state, 'fuzzing', generatedRequestBody($operation['operation'], $state['components']), false, $result);
-            if (failureLimitReached($state)) break 2;
+            foreach ($modes as $mode) {
+                if ($mode === 'negative' && !operationHasInput($operation['operation'])) {
+                    $result['skipped']++;
+                    continue;
+                }
+                runCase($operation, $state, 'fuzzing', generatedRequestBody($operation['operation'], $state['components'], $mode), false, $result, $mode);
+                if (failureLimitReached($state)) break 3;
+                if ($deadline !== null && microtime(true) >= $deadline) break 3;
+            }
+        }
+    }
+    return $result;
+}
+
+function operationHasInput(array $operation): bool {
+    if (isset($operation['requestBody'])) return true;
+    foreach (operationParameters($operation) as $parameter) {
+        if (in_array($parameter['in'] ?? '', ['path', 'query', 'header', 'cookie'], true)) return true;
+    }
+    return false;
+}
+
+function runStatefulPhase(array $operations, array &$state, int $maxExamples, ?float $deadline = null): array {
+    $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
+    $iterations = max(1, min($maxExamples, 25));
+    for ($i = 0; $i < $iterations; $i++) {
+        foreach ($operations as $operation) {
+            if ($deadline !== null && microtime(true) >= $deadline) return $result;
+            runCase($operation, $state, 'stateful', generatedRequestBody($operation['operation'], $state['components'], 'positive'), false, $result, 'positive');
+            if (failureLimitReached($state)) return $result;
         }
     }
     return $result;
@@ -690,31 +1466,38 @@ function exampleRequestBody(array $operation): ?string {
     return '{}';
 }
 
-function generatedRequestBody(array $operation, array $components): ?string {
+function generatedRequestBody(array $operation, array $components, string $mode = 'positive'): ?string {
     $json = $operation['requestBody']['content']['application/json'] ?? null;
     if (!$json) return null;
     $schema = $json['schema'] ?? ['type' => 'object'];
-    return json_encode(generateValue($schema, $components));
+    $value = $mode === 'negative' ? generateInvalidValue($schema, $components) : generateValue($schema, $components);
+    return json_encode($value);
 }
 
-function runCase(array $op, array &$state, string $phase, ?string $body, bool $useExamples, array &$result): void {
+function runCase(array $op, array &$state, string $phase, ?string $body, bool $useExamples, array &$result, string $caseMode = 'positive'): void {
     $method = $op['method'];
     $path = concretePath($op['path'], $op['operation'], $useExamples);
-    $url = $state['base_url'] . $path . queryString($op['operation'], $state['components'], $useExamples);
+    $query = queryString($op['operation'], $state['components'], $useExamples, $caseMode);
+    $pathQuery = $path . $query;
+    $url = $state['base_url'] . $pathQuery;
     $headers = $state['headers'];
+    foreach (operationParameterHeaders($op['operation'], $state['components'], $useExamples, $caseMode) as $header) $headers[] = $header;
     if ($body !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: application/json';
+    $request = buildRequestRecord($phase, $op, $method, $url, $pathQuery, $headers, $body, $caseMode);
 
     try {
         $response = requestWithState($method, $url, $headers, $body, $state);
     } catch (Throwable $e) {
-        recordFailure($state, $result, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}");
+        $case = recordCase($state, $request, null, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}");
+        recordFailure($state, $result, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}", $case);
         return;
     }
 
     $state['cases']++;
-    $failure = validateResponse($op, $response, $state['components'], $state['checks'], $state['max_response_time']);
+    $failure = validateResponse($op, $response, $state['components'], $state['checks'], $state['max_response_time'], $caseMode);
+    $case = recordCase($state, $request, $response, $failure);
     if ($failure) {
-        recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}");
+        recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}", $case);
     } else {
         $result['passed']++;
     }
@@ -723,18 +1506,24 @@ function runCase(array $op, array &$state, string $phase, ?string $body, bool $u
 function runInvalidPathCase(array $op, array &$state, array &$result): void {
     if (!str_contains($op['path'], '{')) return;
     $path = preg_replace('/\{[^}]+\}/', 'not-an-id', $op['path'], 1);
+    $url = $state['base_url'] . $path;
+    $request = buildRequestRecord('coverage', $op, $op['method'], $url, $path, $state['headers'], null);
     try {
-        $response = requestWithState($op['method'], $state['base_url'] . $path, $state['headers'], null, $state);
+        $response = requestWithState($op['method'], $url, $state['headers'], null, $state);
     } catch (Throwable $e) {
-        recordFailure($state, $result, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}");
+        $case = recordCase($state, $request, null, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}");
+        recordFailure($state, $result, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}", $case);
         return;
     }
     $state['cases']++;
     $contentType = strtolower($response['headers']['content-type'] ?? '');
     if ($response['status'] === 404 && str_contains($contentType, 'application/json')) {
+        recordCase($state, $request, $response, null);
         $result['passed']++;
     } else {
-        recordFailure($state, $result, "coverage {$op['method']} {$path}: expected JSON 404, got HTTP {$response['status']} {$contentType}");
+        $failure = "coverage {$op['method']} {$path}: expected JSON 404, got HTTP {$response['status']} {$contentType}";
+        $case = recordCase($state, $request, $response, $failure);
+        recordFailure($state, $result, $failure, $case);
     }
 }
 
@@ -742,19 +1531,26 @@ function runUnsupportedMethodCase(array $op, array &$state, array &$result): voi
     if (!in_array('unsupported_method', $state['checks'], true)) return;
     $allowed = allowedMethodsForPathItem($op['path_item']);
     if (!$allowed) return;
+    $path = concretePath($op['path'], $op['operation'], true);
+    $url = $state['base_url'] . $path;
+    $request = buildRequestRecord('coverage', $op, 'TRACE', $url, $path, $state['headers'], null);
     try {
-        $response = requestWithState('TRACE', $state['base_url'] . concretePath($op['path'], $op['operation'], true), $state['headers'], null, $state);
+        $response = requestWithState('TRACE', $url, $state['headers'], null, $state);
     } catch (Throwable $e) {
-        recordFailure($state, $result, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}");
+        $case = recordCase($state, $request, null, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}");
+        recordFailure($state, $result, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}", $case);
         return;
     }
     $state['cases']++;
     $allow = $response['headers']['allow'] ?? '';
     $missing = array_filter($allowed, fn($method) => !str_contains($allow, $method));
     if ($response['status'] === 405 && !$missing) {
+        recordCase($state, $request, $response, null);
         $result['passed']++;
     } else {
-        recordFailure($state, $result, "coverage TRACE {$op['path']}: expected 405 with Allow [" . implode(', ', $allowed) . "], got HTTP {$response['status']} Allow '{$allow}'");
+        $failure = "coverage TRACE {$op['path']}: expected 405 with Allow [" . implode(', ', $allowed) . "], got HTTP {$response['status']} Allow '{$allow}'";
+        $case = recordCase($state, $request, $response, $failure);
+        recordFailure($state, $result, $failure, $case);
     }
 }
 
@@ -780,10 +1576,17 @@ function requestWithState(string $method, string $url, array $headers, ?string $
     } while (true);
 }
 
-function validateResponse(array $op, array $response, array $components, array $checks, ?float $maxResponseTime): ?string {
+function validateResponse(array $op, array $response, array $components, array $checks, ?float $maxResponseTime, string $caseMode = 'positive'): ?string {
     $status = $response['status'];
     if ($maxResponseTime !== null && ($response['duration'] ?? 0.0) > $maxResponseTime) {
         return sprintf('response time %.6fs exceeded %.6fs', $response['duration'], $maxResponseTime);
+    }
+
+    if ($caseMode === 'negative' && in_array('negative_data_rejection', $checks, true) && ($status < 400 || $status >= 500)) {
+        return "negative input was not rejected with a 4xx response; got HTTP {$status}";
+    }
+    if ($caseMode === 'positive' && in_array('positive_data_acceptance', $checks, true) && $status >= 400 && $status < 500) {
+        return "positive input was rejected with HTTP {$status}";
     }
 
     if (in_array('not_a_server_error', $checks, true) && $status >= 500) {
@@ -902,9 +1705,84 @@ function coerceHeaderBoolean(string $value) {
     };
 }
 
-function recordFailure(array &$state, array &$result, string $message): void {
+function buildRequestRecord(string $phase, array $op, string $method, string $url, string $pathQuery, array $headers, ?string $body, string $mode = 'positive'): array {
+    return [
+        'phase' => $phase,
+        'mode' => $mode,
+        'operation' => $op,
+        'method' => $method,
+        'url' => $url,
+        'path_query' => $pathQuery,
+        'headers' => $headers,
+        'body' => $body
+    ];
+}
+
+function recordCase(array &$state, array $request, ?array $response, ?string $failure): array {
+    $id = caseId($request, $response, $failure, count($state['case_records'] ?? []));
+    $case = [
+        'id' => $id,
+        'time' => gmdate('c'),
+        'schema_location' => $state['schema_location'] ?? null,
+        'base_url' => $state['base_url'] ?? null,
+        'checks' => $state['checks'] ?? [],
+        'max_response_time' => $state['max_response_time'] ?? null,
+        'components' => $state['components'] ?? [],
+        'request' => $request,
+        'response' => normalizeResponseForRecord($response),
+        'failure' => $failure
+    ];
+    $state['case_records'][] = $case;
+    return $case;
+}
+
+function caseId(array $request, ?array $response, ?string $failure, int $index): string {
+    return substr(hash('sha256', json_encode([
+        $request['method'] ?? '',
+        $request['url'] ?? '',
+        $request['body'] ?? '',
+        $response['status'] ?? null,
+        $failure,
+        microtime(true),
+        $index,
+        random_int(1, PHP_INT_MAX)
+    ])), 0, 12);
+}
+
+function normalizeResponseForRecord(?array $response): ?array {
+    if ($response === null) return null;
+    return [
+        'status' => $response['status'] ?? 0,
+        'headers' => $response['headers'] ?? [],
+        'body' => $response['body'] ?? '',
+        'duration' => $response['duration'] ?? 0.0
+    ];
+}
+
+function recordFailure(array &$state, array &$result, string $message, ?array $case = null): void {
     $result['failed']++;
-    $state['failures'][] = $message;
+    $state['failures'][] = $case ? "{$message} (case {$case['id']})" : $message;
+    if ($case !== null) saveCrashFile($state, $case);
+}
+
+function saveCrashFile(array $state, array $case): void {
+    $dir = rtrim((string)($state['cache_dir'] ?? DEFAULT_CACHE_DIR), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crashes';
+    if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) return;
+    $path = $dir . DIRECTORY_SEPARATOR . $case['id'] . '.json';
+    $crash = [
+        'id' => $case['id'],
+        'created_at' => $case['time'],
+        'schema_location' => $case['schema_location'],
+        'base_url' => $case['base_url'],
+        'checks' => $case['checks'],
+        'max_response_time' => $case['max_response_time'],
+        'components' => $case['components'],
+        'operation' => $case['request']['operation']['operation'] ?? null,
+        'operation_path' => $case['request']['operation']['path'] ?? null,
+        'request' => $case['request'],
+        'failure' => $case['failure']
+    ];
+    file_put_contents($path, json_encode($crash, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
 function failureLimitReached(array $state): bool {
@@ -914,7 +1792,7 @@ function failureLimitReached(array $state): bool {
 function concretePath(string $path, array $operation, bool $useExamples): string {
     return preg_replace_callback('/\{([^}]+)\}/', function(array $match) use ($operation, $useExamples) {
         $name = $match[1];
-        foreach (($operation['parameters'] ?? []) as $parameter) {
+        foreach (operationParameters($operation) as $parameter) {
             if (($parameter['in'] ?? '') === 'path' && ($parameter['name'] ?? '') === $name) {
                 if ($useExamples && array_key_exists('example', $parameter)) return rawurlencode((string)$parameter['example']);
                 return rawurlencode((string)generateValue($parameter['schema'] ?? ['type' => 'integer'], []));
@@ -924,19 +1802,59 @@ function concretePath(string $path, array $operation, bool $useExamples): string
     }, $path);
 }
 
-function queryString(array $operation, array $components, bool $useExamples): string {
+function queryString(array $operation, array $components, bool $useExamples, string $caseMode = 'positive'): string {
     $query = [];
-    foreach (($operation['parameters'] ?? []) as $parameter) {
+    foreach (operationParameters($operation) as $parameter) {
         if (($parameter['in'] ?? '') !== 'query') continue;
         $required = (bool)($parameter['required'] ?? false);
         if (!$required && !$useExamples && mt_rand(0, 1) === 0) continue;
         if ($useExamples && array_key_exists('example', $parameter)) {
             $query[$parameter['name']] = $parameter['example'];
         } elseif ($required || !$useExamples) {
-            $query[$parameter['name']] = generateValue($parameter['schema'] ?? ['type' => 'string'], $components);
+            $query[$parameter['name']] = $caseMode === 'negative'
+                ? generateInvalidValue($parameter['schema'] ?? ['type' => 'string'], $components)
+                : generateValue($parameter['schema'] ?? ['type' => 'string'], $components);
         }
     }
     return $query ? '?' . http_build_query($query) : '';
+}
+
+function operationParameterHeaders(array $operation, array $components, bool $useExamples, string $caseMode): array {
+    $headers = [];
+    $cookies = [];
+    foreach (operationParameters($operation) as $parameter) {
+        $location = $parameter['in'] ?? '';
+        if ($location !== 'header' && $location !== 'cookie') continue;
+        $required = (bool)($parameter['required'] ?? false);
+        if (!$required && !$useExamples && mt_rand(0, 1) === 0) continue;
+        $value = parameterValue($parameter, $components, $useExamples, $caseMode);
+        if ($location === 'header') {
+            $headers[] = $parameter['name'] . ': ' . serializeParameterValue($value);
+        } else {
+            $cookies[] = rawurlencode((string)$parameter['name']) . '=' . rawurlencode(serializeParameterValue($value));
+        }
+    }
+    if ($cookies) $headers[] = 'Cookie: ' . implode('; ', $cookies);
+    return $headers;
+}
+
+function operationParameters(array $operation): array {
+    return array_values(array_filter($operation['parameters'] ?? [], 'is_array'));
+}
+
+function parameterValue(array $parameter, array $components, bool $useExamples, string $caseMode) {
+    if ($useExamples && array_key_exists('example', $parameter)) return $parameter['example'];
+    $schema = $parameter['schema'] ?? ['type' => 'string'];
+    return $caseMode === 'negative' ? generateInvalidValue($schema, $components) : generateValue($schema, $components);
+}
+
+function serializeParameterValue($value): string {
+    if (is_array($value)) {
+        if (isAssocArray($value)) return implode(',', array_map(fn($key, $item) => $key . ',' . $item, array_keys($value), $value));
+        return implode(',', array_map('strval', $value));
+    }
+    if (is_bool($value)) return $value ? 'true' : 'false';
+    return (string)$value;
 }
 
 function allowedMethodsForPathItem(array $pathItem): array {
@@ -975,6 +1893,50 @@ function generateValue(array $schema, array $components) {
         'boolean' => (bool)mt_rand(0, 1),
         default => generateString($schema)
     };
+}
+
+function generateInvalidValue(array $schema, array $components) {
+    $schema = resolveSchemaRef($schema, $components);
+    if (isset($schema['enum']) && is_array($schema['enum'])) return '__invalid_enum_' . mt_rand(1, 100000);
+    if (isset($schema['oneOf'][0])) return generateInvalidValue($schema['oneOf'][0], $components);
+    if (isset($schema['allOf'][0])) return generateInvalidValue($schema['allOf'][0], $components);
+
+    $type = $schema['type'] ?? 'string';
+    if (is_array($type)) $type = $type[0] ?? 'string';
+    return match ($type) {
+        'object' => generateInvalidObject($schema, $components),
+        'array' => 'not-an-array',
+        'integer' => 'not-an-integer',
+        'number' => 'not-a-number',
+        'boolean' => 'not-a-boolean',
+        'string' => generateInvalidString($schema),
+        default => null
+    };
+}
+
+function generateInvalidObject(array $schema, array $components): array {
+    $properties = $schema['properties'] ?? [];
+    $required = $schema['required'] ?? [];
+    $value = [];
+    foreach ($properties as $name => $propertySchema) {
+        if (in_array($name, $required, true) && mt_rand(0, 1) === 0) continue;
+        $value[$name] = mt_rand(0, 2) === 0 ? generateInvalidValue($propertySchema, $components) : generateValue($propertySchema, $components);
+    }
+    if (($schema['additionalProperties'] ?? null) === false) {
+        $value['__unexpected_' . mt_rand(1, 1000)] = true;
+    }
+    if (!$value && $properties) {
+        $firstName = array_key_first($properties);
+        $value[$firstName] = generateInvalidValue($properties[$firstName], $components);
+    }
+    return $value;
+}
+
+function generateInvalidString(array $schema) {
+    if (isset($schema['maxLength'])) return str_repeat('x', max(1, (int)$schema['maxLength'] + 1));
+    if (isset($schema['minLength']) && (int)$schema['minLength'] > 0) return '';
+    if (($schema['format'] ?? '') === 'uri') return 'not a uri';
+    return 12345;
 }
 
 function generateObject(array $schema, array $components): array {
@@ -1132,4 +2094,165 @@ function printSummary(array $operations, array $phaseResults, array $state): voi
     if ($skipped) echo ", {$skipped} skipped";
     echo "\n";
     echo "Seed: {$state['seed']}\n";
+}
+
+function writeReports(array $state, array $phaseResults): void {
+    $report = $state['report'] ?? ['formats' => []];
+    foreach (($report['formats'] ?? []) as $format) {
+        $path = (string)($report['paths'][$format] ?? '');
+        if ($path === '') continue;
+        $dir = dirname($path);
+        if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+            fwrite(STDERR, "Could not create report directory: {$dir}\n");
+            continue;
+        }
+        $content = match ($format) {
+            'junit' => junitReport($state, $phaseResults),
+            'har' => harReport($state),
+            'ndjson' => ndjsonReport($state, $phaseResults),
+            'vcr' => vcrReport($state),
+            default => null
+        };
+        if ($content !== null) {
+            file_put_contents($path, $content);
+            echo "Report written: {$path}\n";
+        }
+    }
+}
+
+function junitReport(array $state, array $phaseResults): string {
+    $cases = $state['case_records'] ?? [];
+    $failures = array_values(array_filter($cases, fn(array $case) => $case['failure'] !== null));
+    $time = array_sum(array_map(fn(array $case) => (float)($case['response']['duration'] ?? 0.0), $cases));
+    $xml = [];
+    $xml[] = '<?xml version="1.0" encoding="UTF-8"?>';
+    $xml[] = sprintf(
+        '<testsuite name="openapi-contract-php" tests="%d" failures="%d" errors="0" skipped="0" time="%.6f">',
+        count($cases),
+        count($failures),
+        $time
+    );
+    foreach ($cases as $case) {
+        $name = trim(($case['request']['method'] ?? '') . ' ' . (($case['request']['operation']['path'] ?? $case['request']['path_query'] ?? '')));
+        $xml[] = sprintf(
+            '  <testcase classname="%s" name="%s" time="%.6f">',
+            xmlEscape((string)($case['request']['phase'] ?? 'case')),
+            xmlEscape($name),
+            (float)($case['response']['duration'] ?? 0.0)
+        );
+        if ($case['failure'] !== null) {
+            $xml[] = sprintf('    <failure message="%s">%s</failure>', xmlEscape($case['failure']), xmlEscape(json_encode($case, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)));
+        }
+        $xml[] = '  </testcase>';
+    }
+    $xml[] = '</testsuite>';
+    return implode("\n", $xml) . "\n";
+}
+
+function harReport(array $state): string {
+    $entries = [];
+    foreach (($state['case_records'] ?? []) as $case) {
+        $request = $case['request'];
+        $response = $case['response'] ?? [];
+        $entries[] = [
+            'startedDateTime' => $case['time'],
+            'time' => round((float)($response['duration'] ?? 0.0) * 1000, 3),
+            'request' => [
+                'method' => $request['method'],
+                'url' => $request['url'],
+                'httpVersion' => 'HTTP/1.1',
+                'headers' => headerLinesToHar($request['headers'] ?? []),
+                'queryString' => queryStringToHar((string)parse_url($request['url'], PHP_URL_QUERY)),
+                'cookies' => [],
+                'headersSize' => -1,
+                'bodySize' => $request['body'] === null ? 0 : strlen((string)$request['body']),
+                'postData' => $request['body'] === null ? null : ['mimeType' => 'application/json', 'text' => $request['body']]
+            ],
+            'response' => [
+                'status' => (int)($response['status'] ?? 0),
+                'statusText' => '',
+                'httpVersion' => 'HTTP/1.1',
+                'headers' => assocHeadersToHar($response['headers'] ?? []),
+                'cookies' => [],
+                'content' => [
+                    'size' => strlen((string)($response['body'] ?? '')),
+                    'mimeType' => $response['headers']['content-type'] ?? '',
+                    'text' => (string)($response['body'] ?? '')
+                ],
+                'redirectURL' => '',
+                'headersSize' => -1,
+                'bodySize' => strlen((string)($response['body'] ?? ''))
+            ],
+            'cache' => new stdClass(),
+            'timings' => ['send' => 0, 'wait' => round((float)($response['duration'] ?? 0.0) * 1000, 3), 'receive' => 0]
+        ];
+    }
+    return json_encode(['log' => ['version' => '1.2', 'creator' => ['name' => 'openapi-contract-php', 'version' => '0.1'], 'entries' => $entries]], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+}
+
+function ndjsonReport(array $state, array $phaseResults): string {
+    $lines = [];
+    foreach (($state['case_records'] ?? []) as $case) {
+        $lines[] = json_encode(['type' => 'case', 'case' => $case], JSON_UNESCAPED_SLASHES);
+    }
+    $lines[] = json_encode([
+        'type' => 'summary',
+        'cases' => $state['cases'],
+        'failures' => count($state['failures'] ?? []),
+        'phases' => $phaseResults,
+        'seed' => $state['seed'] ?? null
+    ], JSON_UNESCAPED_SLASHES);
+    return implode("\n", $lines) . "\n";
+}
+
+function vcrReport(array $state): string {
+    $lines = ["interactions:"];
+    foreach (($state['case_records'] ?? []) as $case) {
+        $request = $case['request'];
+        $response = $case['response'] ?? [];
+        $lines[] = "  - id: " . yamlScalar($case['id']);
+        $lines[] = "    request:";
+        $lines[] = "      method: " . yamlScalar($request['method']);
+        $lines[] = "      uri: " . yamlScalar($request['url']);
+        $lines[] = "      body: " . yamlScalar((string)($request['body'] ?? ''));
+        $lines[] = "    response:";
+        $lines[] = "      status: " . (int)($response['status'] ?? 0);
+        $lines[] = "      body: " . yamlScalar((string)($response['body'] ?? ''));
+        if ($case['failure'] !== null) $lines[] = "    failure: " . yamlScalar($case['failure']);
+    }
+    return implode("\n", $lines) . "\n";
+}
+
+function headerLinesToHar(array $headers): array {
+    $result = [];
+    foreach ($headers as $header) {
+        if (!str_contains((string)$header, ':')) continue;
+        [$name, $value] = explode(':', (string)$header, 2);
+        $result[] = ['name' => trim($name), 'value' => trim($value)];
+    }
+    return $result;
+}
+
+function assocHeadersToHar(array $headers): array {
+    $result = [];
+    foreach ($headers as $name => $value) $result[] = ['name' => (string)$name, 'value' => (string)$value];
+    return $result;
+}
+
+function queryStringToHar(string $query): array {
+    if ($query === '') return [];
+    $result = [];
+    parse_str($query, $values);
+    foreach ($values as $name => $value) {
+        $result[] = ['name' => (string)$name, 'value' => is_array($value) ? json_encode($value) : (string)$value];
+    }
+    return $result;
+}
+
+function xmlEscape(string $value): string {
+    return htmlspecialchars($value, ENT_QUOTES | ENT_XML1, 'UTF-8');
+}
+
+function yamlScalar(string $value): string {
+    return json_encode($value, JSON_UNESCAPED_SLASHES);
 }

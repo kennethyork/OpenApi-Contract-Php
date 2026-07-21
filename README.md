@@ -14,6 +14,30 @@ extensibility. CI/CD integrations are intentionally out of scope.
 
 ## Usage
 
+Start the menu-driven CLI:
+
+```bash
+php bin/openapi-contract interactive
+```
+
+Create a reusable config interactively:
+
+```bash
+php bin/openapi-contract init
+```
+
+Check the local PHP/runtime/schema setup:
+
+```bash
+php bin/openapi-contract doctor --config openapi-contract.json
+```
+
+Run from config:
+
+```bash
+php bin/openapi-contract run --config openapi-contract.json
+```
+
 ```bash
 php bin/openapi-contract run https://api.example.com/openapi.json --phases examples,coverage,fuzzing --max-examples 5
 ```
@@ -52,7 +76,16 @@ Useful options:
 --max-redirects 3
 --proxy http://127.0.0.1:8081
 --tls-verify false
+--report ndjson,junit
+--report-dir openapi-contract-report
+--cache-dir .openapi-contract/cache
 --seed 1234
+```
+
+Replay saved failing cases:
+
+```bash
+php bin/openapi-contract replay --cache-dir .openapi-contract/cache
 ```
 
 ## Checks
@@ -62,11 +95,12 @@ Useful options:
 - `content_type_conformance`
 - `response_headers_conformance`
 - `response_schema_conformance`
+- `negative_data_rejection`
+- `positive_data_acceptance`
 - `unsupported_method`
 
 The CLI also accepts planned runtime checks that are not implemented yet,
-including `negative_data_rejection`, `positive_data_acceptance`,
-`use_after_free`, `ensure_resource_availability`, `ignored_auth`, and
+including `use_after_free`, `ensure_resource_availability`, `ignored_auth`, and
 `missing_required_header`. Those checks produce warnings until their engines are
 implemented.
 

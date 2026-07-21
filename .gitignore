@@ -3,6 +3,10 @@
 /.openapi-contract/
 /openapi-contract-report/
 /benchmark-report/
+/pro/
+/openapi-contract-pro.php
 /openapi-contract.json
 /.openapi-contract.json
+/license.key
+*.license
 *.log

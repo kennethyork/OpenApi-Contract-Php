@@ -28,6 +28,10 @@ The distinct angle is:
 - no CI/CD coupling
 - local contract, fuzz, replay, auth, and stateful workflow checks in one tool
 
+Commercial add-ons can be shipped as a private Pro extension while this
+repository stays useful as the MIT-licensed Community edition. See
+[docs/PRO_EDITION.md](docs/PRO_EDITION.md).
+
 ## Usage
 
 Start the menu-driven CLI:
@@ -70,6 +74,12 @@ Run the broader randomized contract corpus:
 ```bash
 php tests/fixtures/random-openapi/generate.php
 php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
+```
+
+Check whether a private Pro extension is installed:
+
+```bash
+php bin/openapi-contract pro status
 ```
 
 ```bash

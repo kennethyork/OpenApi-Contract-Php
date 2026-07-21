@@ -64,6 +64,7 @@ const HTTP_OPERATION_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 const DEFAULT_CACHE_DIR = '.openapi-contract/cache';
 const DEFAULT_REPORT_DIR = 'openapi-contract-report';
 const JSON_MEDIA_TYPES = ['application/json', 'application/problem+json', 'application/vnd.api+json'];
+const PRO_EXTENSION_PATHS = ['openapi-contract-pro.php', 'pro/openapi-contract-pro.php', '.openapi-contract/pro.php'];
 
 main($argv);
 
@@ -75,6 +76,7 @@ function main(array $argv): void {
 
     $parsed = parseCli($argv);
     $command = $parsed['command'] ?? null;
+    $proExtension = loadProExtension($parsed['options']);
 
     if ($command === 'init') {
         exit(runInitCommand($parsed['location'], $parsed['options']));
@@ -86,6 +88,10 @@ function main(array $argv): void {
 
     if ($command === 'benchmark') {
         exit(runBenchmarkCommand($parsed['location'], $parsed['options']));
+    }
+
+    if ($command === 'pro') {
+        exit(runProCommand($parsed['location'], $parsed['options'], $proExtension));
     }
 
     $options = mergeConfigOptions($parsed['options']);
@@ -209,6 +215,7 @@ function printUsage(): void {
     echo "  php bin/openapi-contract doctor [OPTIONS] [LOCATION]\n";
     echo "  php bin/openapi-contract run [OPTIONS] [LOCATION]\n";
     echo "  php bin/openapi-contract fuzz [OPTIONS] [LOCATION]\n";
+    echo "  php bin/openapi-contract pro [OPTIONS] [ACTION]\n";
     echo "  php bin/openapi-contract replay [OPTIONS] [PATH|CASE_ID]\n\n";
     echo "Options:\n";
     echo "  --config FILE                  Load JSON config defaults, or init target file\n";
@@ -247,11 +254,50 @@ function printUsage(): void {
     echo "  --benchmark-output FILE        Benchmark JSON result path\n";
     echo "  --benchmark-markdown FILE      Benchmark Markdown summary path\n";
     echo "  --benchmark-baseline FILE      Compare benchmark result to a prior JSON result\n";
+    echo "  --pro-path FILE                Load a private Pro extension file\n";
+    echo "  --license-key KEY              Pass a license key to a Pro extension\n";
     echo "  --fail-on-regression           Exit non-zero on unexpected benchmark failures\n";
     echo "  --seed N                       Reproducible random seed\n";
     echo "  --no-interaction               Write init defaults without prompting\n";
     echo "  --force                        Allow init to overwrite an existing config\n";
     echo "  --no-color                     Accepted for CLI compatibility\n";
+}
+
+function loadProExtension(array $options): ?callable {
+    foreach (proExtensionPaths($options) as $path) {
+        if (!is_file($path)) continue;
+        require_once $path;
+        if (function_exists('openapi_contract_pro_command')) {
+            return 'openapi_contract_pro_command';
+        }
+        fwrite(STDERR, "Pro extension loaded from {$path}, but openapi_contract_pro_command was not found.\n");
+        return null;
+    }
+    return null;
+}
+
+function proExtensionPaths(array $options): array {
+    $paths = optionValues($options, 'pro-path');
+    if (!$paths) $paths = PRO_EXTENSION_PATHS;
+    return array_values(array_unique(array_filter(array_map('strval', $paths), fn(string $path): bool => trim($path) !== '')));
+}
+
+function runProCommand(?string $action, array $options, ?callable $extension): int {
+    $action = $action === null || trim($action) === '' ? 'status' : trim($action);
+    if ($extension !== null) {
+        return (int)$extension($action, $options);
+    }
+
+    echo "openapi-contract-php Pro\n";
+    echo str_repeat("-", 24) . "\n\n";
+    echo "No Pro extension is installed.\n\n";
+    echo "Private Pro code can be loaded from one of these ignored paths:\n";
+    foreach (PRO_EXTENSION_PATHS as $path) echo "  - {$path}\n";
+    echo "\nOr pass an explicit extension file:\n";
+    echo "  php bin/openapi-contract pro --pro-path path/to/openapi-contract-pro.php status\n\n";
+    echo "The extension file should define:\n";
+    echo "  openapi_contract_pro_command(string \$action, array \$options): int\n";
+    return 2;
 }
 
 function runInitCommand(?string $target, array $options): int {
@@ -1053,6 +1099,8 @@ function longOptionRequiresValue(string $option): bool {
         'benchmark-output',
         'benchmark-markdown',
         'benchmark-baseline',
+        'pro-path',
+        'license-key',
         'report-junit-path',
         'report-vcr-path',
         'report-har-path',

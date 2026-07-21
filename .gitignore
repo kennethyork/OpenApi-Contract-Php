@@ -2,9 +2,8 @@
 /.phpunit.cache/
 /.openapi-contract/
 /openapi-contract-report/
+/openapi-contract-advanced-report/
 /benchmark-report/
-/pro/
-/openapi-contract-pro.php
 /openapi-contract.json
 /.openapi-contract.json
 /license.key

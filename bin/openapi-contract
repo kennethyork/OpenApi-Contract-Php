@@ -65,8 +65,6 @@ const DEFAULT_CACHE_DIR = '.openapi-contract/cache';
 const DEFAULT_REPORT_DIR = 'openapi-contract-report';
 const JSON_MEDIA_TYPES = ['application/json', 'application/problem+json', 'application/vnd.api+json'];
 const PRO_EXTENSION_PATHS = ['openapi-contract-pro.php', 'pro/openapi-contract-pro.php', '.openapi-contract/pro.php'];
-const PRO_LICENSE_ENV = 'OPENAPI_CONTRACT_PRO_TOKEN';
-const PRO_LICENSE_PATHS = ['.openapi-contract/license.key', 'license.key'];
 
 main($argv);
 
@@ -77,7 +75,6 @@ function main(array $argv): void {
     }
 
     $parsed = parseCli($argv);
-    $parsed['options'] = withResolvedProLicense($parsed['options']);
     $command = $parsed['command'] ?? null;
     $proExtension = loadProExtension($parsed['options']);
 
@@ -259,15 +256,11 @@ function printUsage(): void {
     echo "  --benchmark-output FILE        Benchmark JSON result path\n";
     echo "  --benchmark-markdown FILE      Benchmark Markdown summary path\n";
     echo "  --benchmark-baseline FILE      Compare benchmark result to a prior JSON result\n";
-    echo "  --pro-path FILE                Load a private Pro extension file\n";
-    echo "  --license-key KEY              Pass a license key to a Pro extension\n";
-    echo "  --pro-output-dir DIRECTORY     Pro extension output directory\n";
-    echo "  --pro-project NAME             Pro project/baseline name\n";
-    echo "  --pro-customer NAME            Pro customer/audit label\n";
-    echo "  --pro-rules LIST               Pro rule packs to apply\n";
-    echo "  --pro-plan NAME                Pro license plan for private license issuing\n";
-    echo "  --gumroad-key KEY              Gumroad license key for Pro activation\n";
-    echo "  --gumroad-product-id ID        Gumroad product id for Pro activation\n";
+    echo "  --pro-path FILE                Load an advanced feature extension file\n";
+    echo "  --pro-output-dir DIRECTORY     Advanced report output directory\n";
+    echo "  --pro-project NAME             Project/baseline name for advanced reports\n";
+    echo "  --pro-customer NAME            Customer/audit label for advanced reports\n";
+    echo "  --pro-rules LIST               Advanced rule packs to apply\n";
     echo "  --fail-on-regression           Exit non-zero on unexpected benchmark failures\n";
     echo "  --seed N                       Reproducible random seed\n";
     echo "  --no-interaction               Write init defaults without prompting\n";
@@ -275,47 +268,14 @@ function printUsage(): void {
     echo "  --no-color                     Accepted for CLI compatibility\n";
 }
 
-function withResolvedProLicense(array $options): array {
-    $token = proLicenseToken($options);
-    if ($token !== '') $options['license-key'] = $token;
-    return $options;
-}
-
-function proLicenseToken(array $options): string {
-    $optionToken = optionString($options, 'license-key', '');
-    if ($optionToken !== '') return $optionToken;
-
-    $gumroadToken = optionString($options, 'gumroad-key', '');
-    if ($gumroadToken !== '') return $gumroadToken;
-
-    $envToken = getenv(PRO_LICENSE_ENV);
-    if (is_string($envToken) && trim($envToken) !== '') return trim($envToken);
-
-    foreach (PRO_LICENSE_PATHS as $path) {
-        if (!is_file($path)) continue;
-        $fileToken = trim((string)file_get_contents($path));
-        if ($fileToken !== '') return $fileToken;
-    }
-
-    return '';
-}
-
-function proExtensionInstalled(array $options): bool {
-    foreach (proExtensionPaths($options) as $path) {
-        if (is_file($path)) return true;
-    }
-    return false;
-}
-
 function loadProExtension(array $options): ?callable {
-    if (proLicenseToken($options) === '') return null;
     foreach (proExtensionPaths($options) as $path) {
         if (!is_file($path)) continue;
         require_once $path;
         if (function_exists('openapi_contract_pro_command')) {
             return 'openapi_contract_pro_command';
         }
-        fwrite(STDERR, "Pro extension loaded from {$path}, but openapi_contract_pro_command was not found.\n");
+        fwrite(STDERR, "Advanced extension loaded from {$path}, but openapi_contract_pro_command was not found.\n");
         return null;
     }
     return null;
@@ -333,31 +293,20 @@ function runProCommand(?string $action, array $options, ?callable $extension): i
         return (int)$extension($action, $options);
     }
 
-    echo "openapi-contract-php Pro\n";
-    echo str_repeat("-", 24) . "\n\n";
-    if (proExtensionInstalled($options) && proLicenseToken($options) === '') {
-        echo "Pro extension is installed, but no license token was provided.\n";
-        echo "Community features are active. Pro features are locked.\n\n";
-        echo "Unlock Pro with:\n";
-        echo "  php bin/openapi-contract pro status --license-key YOUR_TOKEN\n";
-        echo "  php bin/openapi-contract pro activate --gumroad-product-id PRODUCT_ID --gumroad-key GUMROAD_LICENSE_KEY\n";
-        echo "  " . PRO_LICENSE_ENV . "=YOUR_TOKEN php bin/openapi-contract pro status\n";
-        echo "  mkdir -p .openapi-contract && printf '%s' YOUR_TOKEN > .openapi-contract/license.key\n";
-        return 3;
-    }
-
-    echo "No unlocked Pro extension is installed.\n\n";
-    echo "Private Pro code can be loaded from one of these ignored paths:\n";
+    echo "openapi-contract-php advanced features\n";
+    echo str_repeat("-", 38) . "\n\n";
+    echo "No advanced extension is installed.\n\n";
+    echo "The bundled open-source extension is expected at one of these paths:\n";
     foreach (PRO_EXTENSION_PATHS as $path) echo "  - {$path}\n";
     echo "\nOr pass an explicit extension file:\n";
     echo "  php bin/openapi-contract pro --pro-path path/to/openapi-contract-pro.php status\n\n";
     echo "The extension file should define:\n";
     echo "  openapi_contract_pro_command(string \$action, array \$options): int\n";
-    echo "\nPaid features can also hook into the same run and benchmark commands:\n";
+    echo "\nAdvanced features can also hook into the same run and benchmark commands:\n";
     echo "  openapi_contract_pro_after_run(array \$state, array \$phaseResults, array \$summary): void\n";
     echo "  openapi_contract_pro_after_benchmark(array \$report, array \$options): void\n";
-    echo "\nTypical Pro additions: HTML/PDF audit reports, team baselines, private rule\n";
-    echo "packs, framework presets, signed PHAR builds, and priority support.\n";
+    echo "\nBundled additions include HTML/PDF audit reports, team baselines, rule packs,\n";
+    echo "framework presets, and PHAR builds.\n";
     return 2;
 }
 
@@ -366,7 +315,7 @@ function runProAfterRunHook(array $state, array $phaseResults, array $summary): 
     try {
         openapi_contract_pro_after_run($state, $phaseResults, $summary);
     } catch (Throwable $e) {
-        fwrite(STDERR, "Pro after-run hook failed: {$e->getMessage()}\n");
+        fwrite(STDERR, "Advanced after-run hook failed: {$e->getMessage()}\n");
     }
 }
 
@@ -375,7 +324,7 @@ function runProAfterBenchmarkHook(array $report, array $options): void {
     try {
         openapi_contract_pro_after_benchmark($report, $options);
     } catch (Throwable $e) {
-        fwrite(STDERR, "Pro after-benchmark hook failed: {$e->getMessage()}\n");
+        fwrite(STDERR, "Advanced after-benchmark hook failed: {$e->getMessage()}\n");
     }
 }
 
@@ -691,7 +640,7 @@ function benchmarkCaseOptions(array $case, array $suite, array $globalOptions, s
     $options = [];
     foreach (($suite['defaults'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
     foreach (($case['options'] ?? []) as $key => $value) $options[kebabCase((string)$key)] = benchmarkOptionValue($value, $baseUrl);
-    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'report', 'auth', 'auth-token', 'pro-path', 'license-key', 'pro-output-dir', 'pro-project', 'pro-customer', 'pro-rules', 'pro-plan', 'gumroad-key', 'gumroad-product-id'] as $key) {
+    foreach (['url', 'seed', 'max-examples', 'max-time', 'phases', 'checks', 'exclude-checks', 'mode', 'request-timeout', 'cache-dir', 'report-dir', 'report', 'auth', 'auth-token', 'pro-path', 'pro-output-dir', 'pro-project', 'pro-customer', 'pro-rules'] as $key) {
         if (array_key_exists($key, $globalOptions)) $options[$key] = $globalOptions[$key];
     }
     if (isset($globalOptions['auth-api-key'])) $options['auth-api-key'] = $globalOptions['auth-api-key'];
@@ -1180,16 +1129,11 @@ function longOptionRequiresValue(string $option): bool {
         'benchmark-markdown',
         'benchmark-baseline',
         'pro-path',
-        'license-key',
         'pro-output-dir',
         'pro-project',
         'pro-customer',
         'pro-rules',
-        'pro-plan',
-        'pro-expires',
         'pro-phar',
-        'gumroad-key',
-        'gumroad-product-id',
         'report-junit-path',
         'report-vcr-path',
         'report-har-path',

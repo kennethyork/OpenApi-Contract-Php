@@ -26,14 +26,13 @@ The distinct angle is:
 - no Composer dependency
 - no hosted service dependency
 - no CI/CD coupling
-- local contract, fuzz, replay, auth, and stateful workflow checks in one tool
+- local contract, fuzz, replay, auth, stateful workflow checks, audit reports,
+  baselines, and packaging in one open-source tool
 
-Commercial add-ons can be shipped as a private Pro extension while this
-repository stays useful as the MIT-licensed Community edition. See
-[docs/PRO_EDITION.md](docs/PRO_EDITION.md). Free and paid users run the same
-CLI; without a license token the CLI stays Community-only, and with a token a
-private extension can unlock paid reports, rule packs, baselines, packaging, and
-support.
+The full feature set is free and open source. Advanced report and baseline
+features are bundled in `pro/openapi-contract-pro.php` and load automatically
+when that file is present. See
+[docs/ADVANCED_FEATURES.md](docs/ADVANCED_FEATURES.md).
 
 ## Usage
 
@@ -79,28 +78,17 @@ php tests/fixtures/random-openapi/generate.php
 php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
 ```
 
-Check whether a private Pro extension is installed:
+Check the bundled advanced features:
 
 ```bash
 php bin/openapi-contract pro status
 ```
 
-Paid users keep the same commands and pass a license token:
+Run with the bundled advanced audit output:
 
 ```bash
 php bin/openapi-contract run ./openapi.json --url http://127.0.0.1:8080 \
-  --license-key YOUR_TOKEN --pro-output-dir pro-report
-```
-
-The token can also come from `OPENAPI_CONTRACT_PRO_TOKEN` or
-`.openapi-contract/license.key`. If you sell Pro through Gumroad, activate a
-buyer key once and then use the same CLI normally:
-
-```bash
-php bin/openapi-contract pro activate \
-  --pro-path pro/openapi-contract-pro.php \
-  --gumroad-product-id PRODUCT_ID \
-  --gumroad-key GUMROAD_LICENSE_KEY
+  --pro-output-dir openapi-contract-advanced-report
 ```
 
 ```bash

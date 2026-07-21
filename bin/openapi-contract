@@ -3,116 +3,729 @@
 declare(strict_types=1);
 
 /**
- * PHP-native launcher.
+ * PHP-native OpenAPI contract and fuzz testing runner.
  *
- * The default path stays entirely in PHP. The upstream Schemathesis bridge is
- * kept as an explicit compatibility command while this project closes parity
- * gaps natively:
+ * This intentionally mirrors the Schemathesis CLI shape used in this repo:
  *
- *   php bin/openapi-contract run ...
- *   php bin/openapi-contract schemathesis run ...
+ *   php bin/openapi-contract run LOCATION --phases examples,coverage,fuzzing --max-examples 5
+ *
+ * It supports core OpenAPI HTTP checks:
+ * - not_a_server_error
+ * - status_code_conformance
+ * - content_type_conformance
+ * - response_headers_conformance
+ * - response_schema_conformance
+ * - unsupported_method
+ *
+ * It is not a byte-for-byte port of Schemathesis/Hypothesis. Full parity would
+ * require a property-based testing engine, shrinking, replay storage, stateful
+ * links, reports, GraphQL support, and a much larger OpenAPI implementation.
  */
+
+const DEFAULT_CHECKS = [
+    'not_a_server_error',
+    'status_code_conformance',
+    'content_type_conformance',
+    'response_headers_conformance',
+    'response_schema_conformance',
+    'unsupported_method'
+];
+
+const HTTP_OPERATION_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 
 main($argv);
 
 function main(array $argv): void {
-    $args = array_slice($argv, 1);
-    if (!$args || in_array($args[0], ['-h', '--help'], true)) {
+    if (!isset($argv[1]) || in_array($argv[1], ['-h', '--help'], true)) {
         printUsage();
         exit(0);
     }
 
-    if (($args[0] ?? '') === 'schemathesis' || getenv('OPENAPI_CONTRACT_SCHEMATHESIS') === '1') {
-        if (($args[0] ?? '') === 'schemathesis') array_shift($args);
-        exit(runSchemathesis($args));
+    $parsed = parseCli($argv);
+    if (($parsed['command'] ?? '') !== 'run' || empty($parsed['location'])) {
+        printUsage();
+        exit(2);
     }
 
-    if (($args[0] ?? '') === 'native') {
-        if (($args[0] ?? '') === 'native') array_shift($args);
+    $options = $parsed['options'];
+    $location = $parsed['location'];
+    $phases = csvOption($options, 'phases', ['examples', 'coverage', 'fuzzing']);
+    $maxExamples = max(1, (int)($options['max-examples'] ?? 5));
+    $maxFailures = isset($options['max-failures']) ? max(1, (int)$options['max-failures']) : null;
+    $timeout = isset($options['request-timeout']) ? max(1.0, (float)$options['request-timeout']) : 10.0;
+    $headers = headersFromOptions($options);
+    $checks = selectedChecks($options);
+    $seed = isset($options['seed']) ? (int)$options['seed'] : random_int(1, PHP_INT_MAX);
+    mt_srand($seed);
+
+    echo "openapi-contract-php v0.1\n";
+    echo str_repeat("-", 20) . "\n\n";
+
+    try {
+        $schema = loadSchema($location, $timeout);
+        $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
+    } catch (Throwable $e) {
+        echo " FAIL Could not load specification: {$e->getMessage()}\n";
+        exit(1);
     }
 
-    exit(runNative($args));
-}
+    $operations = collectOperations($schema);
+    echo " OK   Loaded specification from {$location}\n\n";
+    echo "     Base URL:         {$baseUrl}\n";
+    echo "     Specification:    OpenAPI " . ($schema['openapi'] ?? 'unknown') . "\n";
+    echo "     Operations:       " . count($operations) . " selected / " . count($operations) . " total\n";
+    echo "     Seed:             {$seed}\n\n";
 
-function runSchemathesis(array $args): int {
-    $binary = findSchemathesisBinary();
-    if ($binary === null) {
-        fwrite(STDERR, "Could not find Schemathesis.\n\n");
-        fwrite(STDERR, "Install it, then rerun this command:\n");
-        fwrite(STDERR, "  pipx install schemathesis\n");
-        fwrite(STDERR, "or:\n");
-        fwrite(STDERR, "  python3 -m pip install schemathesis\n\n");
-        fwrite(STDERR, "You can also set OPENAPI_CONTRACT_SCHEMATHESIS_BIN=/path/to/schemathesis.\n");
-        return 2;
+    $state = [
+        'schema' => $schema,
+        'components' => $schema['components'] ?? [],
+        'base_url' => $baseUrl,
+        'headers' => $headers,
+        'checks' => $checks,
+        'timeout' => $timeout,
+        'max_failures' => $maxFailures,
+        'failures' => [],
+        'warnings' => [],
+        'cases' => 0,
+        'seed' => $seed
+    ];
+
+    $phaseResults = [];
+    foreach ($phases as $phase) {
+        if (failureLimitReached($state)) break;
+        $started = microtime(true);
+        $result = match ($phase) {
+            'examples' => runExamplesPhase($operations, $state),
+            'coverage' => runCoveragePhase($operations, $state),
+            'fuzzing' => runFuzzingPhase($operations, $state, $maxExamples),
+            default => ['passed' => 0, 'failed' => 0, 'skipped' => count($operations), 'label' => ucfirst($phase), 'unsupported' => true]
+        };
+        $result['duration'] = microtime(true) - $started;
+        $phaseResults[$phase] = $result;
+        printPhaseResult($phase, $result);
     }
 
-    return runCommand(array_merge([$binary], $args));
+    printFailures($state);
+    printWarnings($state);
+    printSummary($operations, $phaseResults, $state);
+    exit($state['failures'] ? 1 : 0);
 }
 
 function printUsage(): void {
-    echo "openapi-contract-php\n";
-    echo "\n";
-    echo "Usage:\n";
-    echo "  php bin/openapi-contract run [OPTIONS] LOCATION\n";
-    echo "  php bin/openapi-contract native run [OPTIONS] LOCATION\n";
-    echo "  php bin/openapi-contract schemathesis [SCHEMATHESIS OPTIONS]\n";
-    echo "\n";
-    echo "Default mode runs the PHP-native implementation.\n";
-    echo "Use the schemathesis command only when comparing behavior with upstream.\n";
-    echo "Set OPENAPI_CONTRACT_SCHEMATHESIS_BIN to choose a specific upstream binary.\n";
+    echo "Usage: php bin/openapi-contract run [OPTIONS] LOCATION\n\n";
+    echo "Options:\n";
+    echo "  -u, --url URL                  API base URL for file-based schemas\n";
+    echo "  -H, --header NAME:VALUE        Add a custom HTTP header\n";
+    echo "  --phases LIST                  examples,coverage,fuzzing\n";
+    echo "  --checks LIST                  Checks to run, or all\n";
+    echo "  --exclude-checks LIST          Checks to skip\n";
+    echo "  -n, --max-examples N           Fuzz examples per operation\n";
+    echo "  --max-failures N               Stop after N failures\n";
+    echo "  --request-timeout SECONDS      Per-request timeout\n";
+    echo "  --seed N                       Reproducible random seed\n";
+    echo "  --no-color                     Accepted for CLI compatibility\n";
 }
 
-function findSchemathesisBinary(): ?string {
-    $configured = getenv('OPENAPI_CONTRACT_SCHEMATHESIS_BIN');
-    if (is_string($configured) && trim($configured) !== '') {
-        $configured = trim($configured);
-        return isExecutableCommand($configured) ? $configured : null;
+function parseCli(array $argv): array {
+    $command = $argv[1] ?? null;
+    $options = [];
+    $location = null;
+    $count = count($argv);
+    for ($i = 2; $i < $count; $i++) {
+        $arg = $argv[$i];
+        if ($arg === '-H' || $arg === '--header') {
+            $options['header'][] = $argv[++$i] ?? '';
+            continue;
+        }
+        if ($arg === '-u' || $arg === '--url') {
+            $options['url'] = $argv[++$i] ?? '';
+            continue;
+        }
+        if ($arg === '-n' || $arg === '--max-examples') {
+            $options['max-examples'] = $argv[++$i] ?? '1';
+            continue;
+        }
+        if (str_starts_with($arg, '--')) {
+            $arg = substr($arg, 2);
+            if (str_contains($arg, '=')) {
+                [$key, $value] = explode('=', $arg, 2);
+                if ($key === 'header') $options['header'][] = $value;
+                else $options[$key] = $value;
+            } else {
+                $value = $argv[$i + 1] ?? null;
+                if ($value !== null && !str_starts_with($value, '-')) {
+                    $options[$arg] = $value;
+                    $i++;
+                } else {
+                    $options[$arg] = true;
+                }
+            }
+            continue;
+        }
+        $location = $arg;
+    }
+    return ['command' => $command, 'location' => $location, 'options' => $options];
+}
+
+function csvOption(array $options, string $name, array $default): array {
+    $value = $options[$name] ?? null;
+    if ($value === null || $value === true || $value === '') return $default;
+    return array_values(array_filter(array_map('trim', explode(',', (string)$value))));
+}
+
+function headersFromOptions(array $options): array {
+    $headers = ['Accept: application/json'];
+    foreach ((array)($options['header'] ?? []) as $header) {
+        if (trim((string)$header) !== '') $headers[] = trim((string)$header);
+    }
+    if (isset($options['auth']) && !hasHeader($headers, 'authorization')) {
+        $headers[] = 'Authorization: Basic ' . base64_encode((string)$options['auth']);
+    }
+    return $headers;
+}
+
+function hasHeader(array $headers, string $name): bool {
+    $prefix = strtolower($name) . ':';
+    foreach ($headers as $header) {
+        if (str_starts_with(strtolower($header), $prefix)) return true;
+    }
+    return false;
+}
+
+function selectedChecks(array $options): array {
+    $checks = csvOption($options, 'checks', DEFAULT_CHECKS);
+    if (in_array('all', $checks, true)) $checks = DEFAULT_CHECKS;
+    $exclude = csvOption($options, 'exclude-checks', []);
+    if (in_array('all', $exclude, true)) return [];
+    return array_values(array_diff($checks, $exclude));
+}
+
+function loadSchema(string $location, float $timeout): array {
+    if (preg_match('#^https?://#', $location)) {
+        $response = httpRequest('GET', $location, ['Accept: application/json'], null, $timeout);
+        if ($response['status'] < 200 || $response['status'] >= 300) {
+            throw new RuntimeException("schema returned HTTP {$response['status']}");
+        }
+        $json = $response['body'];
+    } else {
+        if (!is_file($location)) throw new RuntimeException("schema file not found: {$location}");
+        $json = file_get_contents($location);
+    }
+    $schema = json_decode((string)$json, true);
+    if (!is_array($schema)) throw new RuntimeException('schema is not valid JSON');
+    return $schema;
+}
+
+function httpRequest(string $method, string $url, array $headers, ?string $body, float $timeout): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_CONNECTTIMEOUT => min(5.0, $timeout),
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_HTTPHEADER => $headers
+    ]);
+    if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        throw new RuntimeException($error);
+    }
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $rawHeaders = substr($raw, 0, $headerSize);
+    $responseBody = substr($raw, $headerSize);
+    curl_close($ch);
+
+    $parsedHeaders = [];
+    foreach (preg_split('/\r\n|\n|\r/', trim($rawHeaders)) as $line) {
+        if (!str_contains($line, ':')) continue;
+        [$name, $value] = explode(':', $line, 2);
+        $parsedHeaders[strtolower(trim($name))] = trim($value);
+    }
+    return ['status' => $status, 'headers' => $parsedHeaders, 'body' => $responseBody];
+}
+
+function baseUrlFromSchema(array $schema, ?string $override): string {
+    if ($override) return rtrim($override, '/');
+    $server = $schema['servers'][0]['url'] ?? null;
+    if (!$server) throw new RuntimeException('schema has no servers[0].url; pass --url');
+    return rtrim((string)$server, '/');
+}
+
+function collectOperations(array $schema): array {
+    $operations = [];
+    foreach (($schema['paths'] ?? []) as $path => $pathItem) {
+        if (!is_array($pathItem)) continue;
+        foreach (HTTP_OPERATION_METHODS as $method) {
+            if (!isset($pathItem[$method]) || !is_array($pathItem[$method])) continue;
+            $operations[] = [
+                'method' => strtoupper($method),
+                'method_key' => $method,
+                'path' => $path,
+                'path_item' => $pathItem,
+                'operation' => $pathItem[$method]
+            ];
+        }
+    }
+    return $operations;
+}
+
+function runExamplesPhase(array $operations, array &$state): array {
+    $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
+    foreach ($operations as $operation) {
+        runCase($operation, $state, 'examples', exampleRequestBody($operation['operation']), true, $result);
+        if (failureLimitReached($state)) break;
+    }
+    return $result;
+}
+
+function runCoveragePhase(array $operations, array &$state): array {
+    $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
+    foreach ($operations as $operation) {
+        runCase($operation, $state, 'coverage', exampleRequestBody($operation['operation']), true, $result);
+        if (!failureLimitReached($state)) runInvalidPathCase($operation, $state, $result);
+        if (!failureLimitReached($state)) runUnsupportedMethodCase($operation, $state, $result);
+        if (failureLimitReached($state)) break;
+    }
+    return $result;
+}
+
+function runFuzzingPhase(array $operations, array &$state, int $maxExamples): array {
+    $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
+    foreach ($operations as $operation) {
+        for ($i = 0; $i < $maxExamples; $i++) {
+            runCase($operation, $state, 'fuzzing', generatedRequestBody($operation['operation'], $state['components']), false, $result);
+            if (failureLimitReached($state)) break 2;
+        }
+    }
+    return $result;
+}
+
+function exampleRequestBody(array $operation): ?string {
+    $json = $operation['requestBody']['content']['application/json'] ?? null;
+    if (!$json) return null;
+    if (array_key_exists('example', $json)) return json_encode($json['example']);
+    return '{}';
+}
+
+function generatedRequestBody(array $operation, array $components): ?string {
+    $json = $operation['requestBody']['content']['application/json'] ?? null;
+    if (!$json) return null;
+    $schema = $json['schema'] ?? ['type' => 'object'];
+    return json_encode(generateValue($schema, $components));
+}
+
+function runCase(array $op, array &$state, string $phase, ?string $body, bool $useExamples, array &$result): void {
+    $method = $op['method'];
+    $path = concretePath($op['path'], $op['operation'], $useExamples);
+    $url = $state['base_url'] . $path . queryString($op['operation'], $state['components'], $useExamples);
+    $headers = $state['headers'];
+    if ($body !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: application/json';
+
+    try {
+        $response = httpRequest($method, $url, $headers, $body, $state['timeout']);
+    } catch (Throwable $e) {
+        recordFailure($state, $result, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}");
+        return;
     }
 
-    foreach (['schemathesis', 'st'] as $candidate) {
-        $resolved = which($candidate);
-        if ($resolved !== null) return $resolved;
+    $state['cases']++;
+    $failure = validateResponse($op, $response, $state['components'], $state['checks']);
+    if ($failure) {
+        recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}");
+    } else {
+        $result['passed']++;
+    }
+}
+
+function runInvalidPathCase(array $op, array &$state, array &$result): void {
+    if (!str_contains($op['path'], '{')) return;
+    $path = preg_replace('/\{[^}]+\}/', 'not-an-id', $op['path'], 1);
+    try {
+        $response = httpRequest($op['method'], $state['base_url'] . $path, $state['headers'], null, $state['timeout']);
+    } catch (Throwable $e) {
+        recordFailure($state, $result, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}");
+        return;
+    }
+    $state['cases']++;
+    $contentType = strtolower($response['headers']['content-type'] ?? '');
+    if ($response['status'] === 404 && str_contains($contentType, 'application/json')) {
+        $result['passed']++;
+    } else {
+        recordFailure($state, $result, "coverage {$op['method']} {$path}: expected JSON 404, got HTTP {$response['status']} {$contentType}");
+    }
+}
+
+function runUnsupportedMethodCase(array $op, array &$state, array &$result): void {
+    if (!in_array('unsupported_method', $state['checks'], true)) return;
+    $allowed = allowedMethodsForPathItem($op['path_item']);
+    if (!$allowed) return;
+    try {
+        $response = httpRequest('TRACE', $state['base_url'] . concretePath($op['path'], $op['operation'], true), $state['headers'], null, $state['timeout']);
+    } catch (Throwable $e) {
+        recordFailure($state, $result, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}");
+        return;
+    }
+    $state['cases']++;
+    $allow = $response['headers']['allow'] ?? '';
+    $missing = array_filter($allowed, fn($method) => !str_contains($allow, $method));
+    if ($response['status'] === 405 && !$missing) {
+        $result['passed']++;
+    } else {
+        recordFailure($state, $result, "coverage TRACE {$op['path']}: expected 405 with Allow [" . implode(', ', $allowed) . "], got HTTP {$response['status']} Allow '{$allow}'");
+    }
+}
+
+function validateResponse(array $op, array $response, array $components, array $checks): ?string {
+    $status = $response['status'];
+    if (in_array('not_a_server_error', $checks, true) && $status >= 500) {
+        return "server error HTTP {$status}";
+    }
+
+    $responses = $op['operation']['responses'] ?? [];
+    $documented = documentedResponseForStatus($responses, $status);
+    if (in_array('status_code_conformance', $checks, true) && $documented === null) {
+        return "undocumented HTTP {$status}";
+    }
+
+    if (!$documented) return null;
+
+    if (in_array('response_headers_conformance', $checks, true)) {
+        $headerFailure = validateResponseHeaders($documented['headers'] ?? [], $response['headers'], $components);
+        if ($headerFailure !== null) return $headerFailure;
+    }
+
+    $json = $documented['content']['application/json'] ?? null;
+    if (!$json) return null;
+
+    $contentType = strtolower($response['headers']['content-type'] ?? '');
+    if (in_array('content_type_conformance', $checks, true) && !str_contains($contentType, 'application/json')) {
+        return "undocumented Content-Type '{$contentType}'";
+    }
+
+    $decoded = json_decode($response['body'], true);
+    if (!is_array($decoded)) return 'invalid JSON response body';
+
+    if (in_array('response_schema_conformance', $checks, true)) {
+        $errors = validateSchema($decoded, $json['schema'] ?? [], $components);
+        if ($errors) return 'response schema mismatch: ' . $errors[0];
     }
     return null;
 }
 
-function isExecutableCommand(string $command): bool {
-    if (str_contains($command, DIRECTORY_SEPARATOR)) {
-        return is_file($command) && is_executable($command);
-    }
-    return which($command) !== null;
-}
-
-function which(string $command): ?string {
-    $path = getenv('PATH') ?: '';
-    foreach (explode(PATH_SEPARATOR, $path) as $directory) {
-        if ($directory === '') continue;
-        $candidate = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $command;
-        if (is_file($candidate) && is_executable($candidate)) return $candidate;
+function documentedResponseForStatus(array $responses, int $status): ?array {
+    $statusKey = (string)$status;
+    $wildcard = substr($statusKey, 0, 1) . 'XX';
+    foreach ([$statusKey, $wildcard, strtolower($wildcard), 'default'] as $key) {
+        if (isset($responses[$key]) && is_array($responses[$key])) return $responses[$key];
     }
     return null;
 }
 
-function runNative(array $args): int {
-    $native = __DIR__ . DIRECTORY_SEPARATOR . 'openapi-contract-native';
-    if (!is_file($native)) {
-        fwrite(STDERR, "PHP-native runner not found at {$native}\n");
-        return 2;
+function validateResponseHeaders(array $documentedHeaders, array $actualHeaders, array $components): ?string {
+    foreach ($documentedHeaders as $name => $header) {
+        if (!is_array($header)) continue;
+        $header = resolveHeaderRef($header, $components);
+        $lookup = strtolower((string)$name);
+        $present = array_key_exists($lookup, $actualHeaders);
+
+        if (($header['required'] ?? false) && !$present) {
+            return "missing required response header '{$name}'";
+        }
+        if (!$present || !isset($header['schema']) || !is_array($header['schema'])) {
+            continue;
+        }
+
+        $schema = resolveSchemaRef($header['schema'], $components);
+        $value = coerceHeaderValue($actualHeaders[$lookup], $schema, $components);
+        $errors = validateSchema($value, $schema, $components, '$headers.' . $name);
+        if ($errors) {
+            return "response header '{$name}' schema mismatch: {$errors[0]}";
+        }
     }
-    return runCommand(array_merge([$native], $args));
+    return null;
 }
 
-function runCommand(array $command): int {
-    $descriptorSpec = [
-        0 => STDIN,
-        1 => STDOUT,
-        2 => STDERR
-    ];
-    $process = proc_open($command, $descriptorSpec, $pipes, null, null, ['bypass_shell' => true]);
-    if (!is_resource($process)) {
-        fwrite(STDERR, "Could not start command: " . implode(' ', $command) . "\n");
-        return 2;
+function resolveHeaderRef(array $header, array $components): array {
+    if (!isset($header['$ref'])) return $header;
+    $prefix = '#/components/headers/';
+    $ref = (string)$header['$ref'];
+    if (!str_starts_with($ref, $prefix)) return $header;
+    $name = substr($ref, strlen($prefix));
+    return $components['headers'][$name] ?? $header;
+}
+
+function coerceHeaderValue(string $value, array $schema, array $components) {
+    $schema = resolveSchemaRef($schema, $components);
+    $type = $schema['type'] ?? null;
+    if (is_array($type)) {
+        foreach ($type as $candidate) {
+            if ($candidate === 'null' && strtolower($value) === 'null') return null;
+            $candidateSchema = $schema;
+            $candidateSchema['type'] = $candidate;
+            $coerced = coerceHeaderValue($value, $candidateSchema, $components);
+            if (!validateSchema($coerced, $candidateSchema, $components)) return $coerced;
+        }
+        return $value;
     }
-    $status = proc_close($process);
-    return is_int($status) ? $status : 1;
+
+    return match ($type) {
+        'array' => coerceHeaderArray($value, $schema, $components),
+        'integer' => preg_match('/^-?\d+$/', $value) ? (int)$value : $value,
+        'number' => is_numeric($value) ? (float)$value : $value,
+        'boolean' => coerceHeaderBoolean($value),
+        default => $value
+    };
+}
+
+function coerceHeaderArray(string $value, array $schema, array $components): array {
+    $itemSchema = $schema['items'] ?? ['type' => 'string'];
+    return array_map(
+        fn(string $item) => coerceHeaderValue(trim($item), $itemSchema, $components),
+        $value === '' ? [] : explode(',', $value)
+    );
+}
+
+function coerceHeaderBoolean(string $value) {
+    return match (strtolower($value)) {
+        'true', '1' => true,
+        'false', '0' => false,
+        default => $value
+    };
+}
+
+function recordFailure(array &$state, array &$result, string $message): void {
+    $result['failed']++;
+    $state['failures'][] = $message;
+}
+
+function failureLimitReached(array $state): bool {
+    return $state['max_failures'] !== null && count($state['failures']) >= $state['max_failures'];
+}
+
+function concretePath(string $path, array $operation, bool $useExamples): string {
+    return preg_replace_callback('/\{([^}]+)\}/', function(array $match) use ($operation, $useExamples) {
+        $name = $match[1];
+        foreach (($operation['parameters'] ?? []) as $parameter) {
+            if (($parameter['in'] ?? '') === 'path' && ($parameter['name'] ?? '') === $name) {
+                if ($useExamples && array_key_exists('example', $parameter)) return rawurlencode((string)$parameter['example']);
+                return rawurlencode((string)generateValue($parameter['schema'] ?? ['type' => 'integer'], []));
+            }
+        }
+        return '1';
+    }, $path);
+}
+
+function queryString(array $operation, array $components, bool $useExamples): string {
+    $query = [];
+    foreach (($operation['parameters'] ?? []) as $parameter) {
+        if (($parameter['in'] ?? '') !== 'query') continue;
+        $required = (bool)($parameter['required'] ?? false);
+        if (!$required && !$useExamples && mt_rand(0, 1) === 0) continue;
+        if ($useExamples && array_key_exists('example', $parameter)) {
+            $query[$parameter['name']] = $parameter['example'];
+        } elseif ($required || !$useExamples) {
+            $query[$parameter['name']] = generateValue($parameter['schema'] ?? ['type' => 'string'], $components);
+        }
+    }
+    return $query ? '?' . http_build_query($query) : '';
+}
+
+function allowedMethodsForPathItem(array $pathItem): array {
+    $methods = [];
+    foreach (HTTP_OPERATION_METHODS as $method) {
+        if (isset($pathItem[$method])) $methods[] = strtoupper($method);
+    }
+    return $methods;
+}
+
+function resolveSchemaRef(array $schema, array $components): array {
+    if (!isset($schema['$ref'])) return $schema;
+    $prefix = '#/components/schemas/';
+    $ref = (string)$schema['$ref'];
+    if (!str_starts_with($ref, $prefix)) return $schema;
+    $name = substr($ref, strlen($prefix));
+    return $components['schemas'][$name] ?? $schema;
+}
+
+function generateValue(array $schema, array $components) {
+    $schema = resolveSchemaRef($schema, $components);
+    if (($schema['nullable'] ?? false) && mt_rand(0, 5) === 0) return null;
+    if (isset($schema['enum']) && is_array($schema['enum']) && $schema['enum']) {
+        return $schema['enum'][array_rand($schema['enum'])];
+    }
+    if (isset($schema['oneOf'][0])) return generateValue($schema['oneOf'][array_rand($schema['oneOf'])], $components);
+    if (isset($schema['allOf'][0])) return generateValue($schema['allOf'][0], $components);
+
+    $type = $schema['type'] ?? 'string';
+    if (is_array($type)) $type = $type[array_rand($type)];
+    return match ($type) {
+        'object' => generateObject($schema, $components),
+        'array' => generateArrayValue($schema, $components),
+        'integer' => generateInteger($schema),
+        'number' => generateInteger($schema) + (mt_rand(0, 99) / 100),
+        'boolean' => (bool)mt_rand(0, 1),
+        default => generateString($schema)
+    };
+}
+
+function generateObject(array $schema, array $components): array {
+    $value = [];
+    $required = $schema['required'] ?? [];
+    foreach (($schema['properties'] ?? []) as $name => $propertySchema) {
+        if (in_array($name, $required, true) || mt_rand(0, 1) === 1) {
+            $value[$name] = generateValue($propertySchema, $components);
+        }
+    }
+    return $value;
+}
+
+function generateArrayValue(array $schema, array $components): array {
+    $count = mt_rand(0, 2);
+    $items = [];
+    for ($i = 0; $i < $count; $i++) $items[] = generateValue($schema['items'] ?? ['type' => 'string'], $components);
+    return $items;
+}
+
+function generateInteger(array $schema): int {
+    $min = isset($schema['minimum']) ? (int)$schema['minimum'] : 0;
+    $max = isset($schema['maximum']) ? (int)$schema['maximum'] : $min + 100;
+    if ($max < $min) $max = $min;
+    return mt_rand($min, $max);
+}
+
+function generateString(array $schema): string {
+    if (($schema['format'] ?? '') === 'uri') return 'https://example.com/' . mt_rand(1, 100000);
+    $max = min(32, max(1, (int)($schema['maxLength'] ?? 12)));
+    $min = min($max, max(1, (int)($schema['minLength'] ?? 1)));
+    $length = mt_rand($min, $max);
+    $alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789-_';
+    $value = '';
+    for ($i = 0; $i < $length; $i++) $value .= $alphabet[mt_rand(0, strlen($alphabet) - 1)];
+    return $value;
+}
+
+function isAssocArray($value): bool {
+    return is_array($value) && array_keys($value) !== range(0, count($value) - 1);
+}
+
+function validateSchema($value, array $schema, array $components, string $path = '$'): array {
+    $schema = resolveSchemaRef($schema, $components);
+    if (($schema['nullable'] ?? false) && $value === null) return [];
+    if (isset($schema['allOf']) && is_array($schema['allOf'])) {
+        foreach ($schema['allOf'] as $part) {
+            $errors = validateSchema($value, $part, $components, $path);
+            if ($errors) return $errors;
+        }
+        return [];
+    }
+    if (isset($schema['oneOf']) && is_array($schema['oneOf'])) {
+        foreach ($schema['oneOf'] as $part) {
+            if (!validateSchema($value, $part, $components, $path)) return [];
+        }
+        return ["{$path} did not match any oneOf schema"];
+    }
+    if (array_key_exists('enum', $schema) && !in_array($value, $schema['enum'], true)) return ["{$path} is not in enum"];
+
+    $type = $schema['type'] ?? null;
+    if ($type === null) return [];
+    if (is_array($type)) {
+        foreach ($type as $candidate) {
+            $candidateSchema = $schema;
+            $candidateSchema['type'] = $candidate;
+            if (!validateSchema($value, $candidateSchema, $components, $path)) return [];
+        }
+        return ["{$path} did not match any type"];
+    }
+
+    return match ($type) {
+        'object' => validateObjectSchema($value, $schema, $components, $path),
+        'array' => validateArraySchema($value, $schema, $components, $path),
+        'integer' => is_int($value) ? [] : ["{$path} is not an integer"],
+        'number' => (is_int($value) || is_float($value)) ? [] : ["{$path} is not a number"],
+        'string' => is_string($value) ? [] : ["{$path} is not a string"],
+        'boolean' => is_bool($value) ? [] : ["{$path} is not a boolean"],
+        default => []
+    };
+}
+
+function validateObjectSchema($value, array $schema, array $components, string $path): array {
+    if (!isAssocArray($value)) return ["{$path} is not an object"];
+    foreach (($schema['required'] ?? []) as $required) {
+        if (!array_key_exists($required, $value)) return ["{$path}.{$required} is required"];
+    }
+    foreach (($schema['properties'] ?? []) as $name => $propertySchema) {
+        if (array_key_exists($name, $value)) {
+            $errors = validateSchema($value[$name], $propertySchema, $components, "{$path}.{$name}");
+            if ($errors) return $errors;
+        }
+    }
+    if (($schema['additionalProperties'] ?? null) === false) {
+        $known = array_keys($schema['properties'] ?? []);
+        foreach (array_keys($value) as $name) {
+            if (!in_array($name, $known, true)) return ["{$path}.{$name} is not documented"];
+        }
+    }
+    return [];
+}
+
+function validateArraySchema($value, array $schema, array $components, string $path): array {
+    if (!is_array($value) || isAssocArray($value)) return ["{$path} is not an array"];
+    foreach ($value as $index => $item) {
+        $errors = validateSchema($item, $schema['items'] ?? [], $components, "{$path}[{$index}]");
+        if ($errors) return $errors;
+    }
+    return [];
+}
+
+function printPhaseResult(string $phase, array $result): void {
+    $icon = $result['failed'] > 0 ? 'FAIL' : 'OK';
+    $label = ucfirst($phase);
+    printf(" %s  %s (in %.2fs)\n", $icon, $label, $result['duration']);
+    echo "     {$result['passed']} passed";
+    if ($result['failed']) echo "  {$result['failed']} failed";
+    if ($result['skipped']) echo "  {$result['skipped']} skipped";
+    echo "\n\n";
+}
+
+function printFailures(array $state): void {
+    if (!$state['failures']) return;
+    echo "=================================== FAILURES ===================================\n";
+    foreach ($state['failures'] as $index => $failure) {
+        $number = $index + 1;
+        echo "{$number}. {$failure}\n";
+    }
+    echo "\n";
+}
+
+function printWarnings(array $state): void {
+    if (!$state['warnings']) return;
+    echo "=================================== WARNINGS ===================================\n";
+    foreach ($state['warnings'] as $warning) echo "- {$warning}\n";
+    echo "\n";
+}
+
+function printSummary(array $operations, array $phaseResults, array $state): void {
+    $failed = count($state['failures']);
+    $passed = array_sum(array_column($phaseResults, 'passed'));
+    $skipped = array_sum(array_column($phaseResults, 'skipped'));
+    echo "=================================== SUMMARY ====================================\n";
+    echo "API Operations:\n";
+    echo "  Selected: " . count($operations) . '/' . count($operations) . "\n";
+    echo "  Tested cases: {$state['cases']}\n\n";
+    echo "Test Phases:\n";
+    foreach ($phaseResults as $phase => $result) {
+        echo '  ' . ($result['failed'] ? 'FAIL' : 'OK') . ' ' . ucfirst($phase) . "\n";
+    }
+    echo "\n";
+    echo "Test cases:\n";
+    echo "  {$passed} passed";
+    if ($failed) echo ", {$failed} failed";
+    if ($skipped) echo ", {$skipped} skipped";
+    echo "\n";
+    echo "Seed: {$state['seed']}\n";
 }

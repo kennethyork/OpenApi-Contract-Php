@@ -1,8 +1,7 @@
 # Schemathesis Parity Matrix
 
-This project targets a PHP-native implementation. The `schemathesis` subcommand
-is only a compatibility bridge for comparing behavior with upstream while native
-features are built.
+This project targets a vanilla PHP CLI implementation. It does not delegate to
+the upstream Python Schemathesis CLI.
 
 Sources checked on July 21, 2026:
 

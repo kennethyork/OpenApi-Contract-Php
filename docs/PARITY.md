@@ -1,9 +1,10 @@
-# Schemathesis Parity Matrix
+# Runtime Feature Parity Matrix
 
 This project targets a vanilla PHP CLI implementation with Schemathesis runtime
 parity. It does not delegate to the upstream Python Schemathesis CLI. CI/CD
 integrations are intentionally excluded; local reports, replay, config, auth,
-stateful testing, GraphQL, and extension points remain in scope.
+stateful testing, GraphQL, and extension points remain in scope. Schemathesis is
+used only as the feature reference, not as a runtime dependency.
 
 Sources checked on July 21, 2026:
 

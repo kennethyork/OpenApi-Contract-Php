@@ -2,11 +2,12 @@
 
 PHP-native OpenAPI contract and fuzz testing runner.
 
-This tool is a vanilla PHP CLI for OpenAPI contract and fuzz testing. It loads
-an OpenAPI 3.x document, runs examples, coverage checks, and generated fuzz
-cases against an HTTP API, then validates status codes, JSON content types,
-response headers, response schemas, server errors, and unsupported method
-handling.
+This tool is a vanilla PHP CLI for OpenAPI and GraphQL contract and fuzz
+testing. It loads OpenAPI 2.0/3.x JSON or YAML documents and simple GraphQL SDL
+files, runs examples, coverage checks, generated fuzz cases, and stateful
+workflows against an HTTP API, then validates status codes, content types,
+response headers, response schemas, server errors, input rejection, auth
+enforcement, required request headers, and unsupported method handling.
 
 The target is a complete local API testing workflow in PHP: CLI commands,
 checks, generation, filtering, stateful workflows, reports, replay, auth, and
@@ -59,6 +60,8 @@ Useful options:
 ```bash
 -H, --header NAME:VALUE
 -a, --auth USER:PASS
+--auth-token TOKEN
+--auth-api-key ApiKeyAuth:secret
 --phases examples,coverage,fuzzing,stateful
 --checks all
 --exclude-checks unsupported_method
@@ -97,12 +100,15 @@ php bin/openapi-contract replay --cache-dir .openapi-contract/cache
 - `response_schema_conformance`
 - `negative_data_rejection`
 - `positive_data_acceptance`
+- `use_after_free`
+- `ensure_resource_availability`
+- `ignored_auth`
+- `missing_required_header`
 - `unsupported_method`
 
-The CLI also accepts planned runtime checks that are not implemented yet,
-including `use_after_free`, `ensure_resource_availability`, `ignored_auth`, and
-`missing_required_header`. Those checks produce warnings until their engines are
-implemented.
+Stateful checks use explicit OpenAPI links, `Location` headers, and simple
+resource dependency inference. Complex API workflows may need explicit links in
+the schema.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature matrix and milestone
 order.

@@ -1,0 +1,37 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Swagger Fixture API",
+    "version": "1.0.0"
+  },
+  "host": "127.0.0.1:8089",
+  "schemes": ["http"],
+  "basePath": "",
+  "produces": ["application/json"],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Health response",
+            "schema": {
+              "$ref": "#/definitions/Health"
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Health": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

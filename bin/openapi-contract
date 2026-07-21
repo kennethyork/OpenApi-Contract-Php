@@ -54,11 +54,16 @@ const IMPLEMENTED_CHECKS = [
     'response_schema_conformance',
     'negative_data_rejection',
     'positive_data_acceptance',
+    'use_after_free',
+    'ensure_resource_availability',
+    'ignored_auth',
+    'missing_required_header',
     'unsupported_method'
 ];
 const HTTP_OPERATION_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 const DEFAULT_CACHE_DIR = '.openapi-contract/cache';
 const DEFAULT_REPORT_DIR = 'openapi-contract-report';
+const JSON_MEDIA_TYPES = ['application/json', 'application/problem+json', 'application/vnd.api+json'];
 
 main($argv);
 
@@ -122,6 +127,7 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
     try {
         $schema = loadSchema($location, $timeout, isset($options['wait-for-schema']) ? (float)$options['wait-for-schema'] : 0.0, $transport);
         $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
+        $headers = mergeHeaders($headers, authHeadersFromSchema($schema, $options));
     } catch (Throwable $e) {
         echo " FAIL Could not load specification: {$e->getMessage()}\n";
         return 1;
@@ -133,7 +139,7 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
     $operations = filterOperations($allOperations, $options, $warnings);
     echo " OK   Loaded specification from {$location}\n\n";
     echo "     Base URL:         {$baseUrl}\n";
-    echo "     Specification:    OpenAPI " . ($schema['openapi'] ?? 'unknown') . "\n";
+    echo "     Specification:    " . specificationLabel($schema) . "\n";
     echo "     Operations:       " . count($operations) . " selected / " . count($allOperations) . " total\n";
     echo "     Seed:             {$seed}\n\n";
 
@@ -157,7 +163,12 @@ function runTestCommand(string $command, ?string $providedLocation, array $optio
         'last_request_at' => null,
         'schema_location' => $location,
         'report' => reportOptionsFromOptions($options),
-        'cache_dir' => (string)($options['cache-dir'] ?? DEFAULT_CACHE_DIR)
+        'cache_dir' => (string)($options['cache-dir'] ?? DEFAULT_CACHE_DIR),
+        'options' => $options,
+        'resource_values' => [],
+        'stateful_links' => discoverStatefulLinks($schema),
+        'output_sanitize' => parseBooleanOption($options['output-sanitize'] ?? true),
+        'output_truncate' => parseBooleanOption($options['output-truncate'] ?? true)
     ];
 
     $phaseResults = [];
@@ -200,12 +211,14 @@ function printUsage(): void {
     echo "  -w, --workers N|auto           Worker count (currently sequential)\n";
     echo "  -H, --header NAME:VALUE        Add a custom HTTP header\n";
     echo "  -a, --auth USER:PASS           Basic authentication\n";
+    echo "  --auth-token TOKEN             Bearer token for HTTP auth schemes\n";
+    echo "  --auth-api-key NAME:VALUE      API key value for a named security scheme\n";
     echo "  --phases LIST                  examples,coverage,fuzzing,stateful\n";
     echo "  --checks LIST                  Checks to run, or all\n";
     echo "  --exclude-checks LIST          Checks to skip\n";
     echo "  --max-response-time SECONDS    Fail responses slower than this limit\n";
-    echo "  --include-TYPE VALUE           TYPE: path, method, tag, operation-id\n";
-    echo "  --exclude-TYPE VALUE           TYPE: path, method, tag, operation-id\n";
+    echo "  --include-TYPE VALUE           TYPE: path, method, name, tag, operation-id\n";
+    echo "  --exclude-TYPE VALUE           TYPE: path, method, name, tag, operation-id\n";
     echo "  --include-TYPE-regex PATTERN   Regex include filter\n";
     echo "  --exclude-TYPE-regex PATTERN   Regex exclude filter\n";
     echo "  --exclude-deprecated           Skip deprecated operations\n";
@@ -497,7 +510,7 @@ function runDoctorCommand(?string $target, array $options): int {
         try {
             $schema = loadSchema($location, $timeout, isset($options['wait-for-schema']) ? (float)$options['wait-for-schema'] : 0.0, $transport);
             doctorLine('OK', 'Schema', $location);
-            doctorLine('OK', 'OpenAPI', (string)($schema['openapi'] ?? 'unknown'));
+            doctorLine('OK', 'Specification', specificationLabel($schema));
 
             $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
             if (preg_match('#^https?://#', $baseUrl)) {
@@ -770,18 +783,22 @@ function longOptionRequiresValue(string $option): bool {
         'max-response-time',
         'include-path',
         'include-method',
+        'include-name',
         'include-tag',
         'include-operation-id',
         'exclude-path',
         'exclude-method',
+        'exclude-name',
         'exclude-tag',
         'exclude-operation-id',
         'include-path-regex',
         'include-method-regex',
+        'include-name-regex',
         'include-tag-regex',
         'include-operation-id-regex',
         'exclude-path-regex',
         'exclude-method-regex',
+        'exclude-name-regex',
         'exclude-tag-regex',
         'exclude-operation-id-regex',
         'include-by',
@@ -806,6 +823,8 @@ function longOptionRequiresValue(string $option): bool {
         'mode',
         'seed',
         'auth',
+        'auth-token',
+        'auth-api-key',
         'generation-allow-x00',
         'generation-codec',
         'generation-maximize',
@@ -822,22 +841,27 @@ function isRepeatableOption(string $option): bool {
         'exclude-checks',
         'include-path',
         'include-method',
+        'include-name',
         'include-tag',
         'include-operation-id',
         'exclude-path',
         'exclude-method',
+        'exclude-name',
         'exclude-tag',
         'exclude-operation-id',
         'include-path-regex',
         'include-method-regex',
+        'include-name-regex',
         'include-tag-regex',
         'include-operation-id-regex',
         'exclude-path-regex',
         'exclude-method-regex',
+        'exclude-name-regex',
         'exclude-tag-regex',
         'exclude-operation-id-regex',
         'include-by',
         'exclude-by',
+        'auth-api-key',
         'report'
     ], true);
 }
@@ -892,11 +916,8 @@ function flattenConfigOptions(array $config): array {
             foreach ($value as $header) $options['header'][] = (string)$header;
             continue;
         }
-        if ($key === 'auth' && is_array($value) && isset($value['basic'])) {
-            $basic = $value['basic'];
-            if (is_array($basic) && isset($basic['username'], $basic['password'])) {
-                $options['auth'] = $basic['username'] . ':' . $basic['password'];
-            }
+        if ($key === 'auth' && is_array($value)) {
+            flattenAuthConfig($value, $options);
             continue;
         }
         if ($key === 'reports' && is_array($value)) {
@@ -918,6 +939,32 @@ function flattenConfigOptions(array $config): array {
         $options[kebabCase((string)$key)] = scalarConfigValue($value);
     }
     return $options;
+}
+
+function flattenAuthConfig(array $auth, array &$options): void {
+    if (isset($auth['basic']) && is_array($auth['basic']) && isset($auth['basic']['username'], $auth['basic']['password'])) {
+        $options['auth'] = $auth['basic']['username'] . ':' . $auth['basic']['password'];
+    }
+    if (isset($auth['bearer'])) {
+        $options['auth-token'] = (string)$auth['bearer'];
+    }
+    if (isset($auth['openapi']) && is_array($auth['openapi'])) {
+        foreach ($auth['openapi'] as $scheme => $settings) {
+            if (!is_array($settings)) continue;
+            foreach (['api-key', 'api_key', 'key', 'token'] as $keyName) {
+                if (isset($settings[$keyName])) {
+                    appendOption($options, 'auth-api-key', $scheme . ':' . (string)$settings[$keyName]);
+                    break;
+                }
+            }
+            if (isset($settings['bearer'])) {
+                $options['auth-token'] = (string)$settings['bearer'];
+            }
+            if (isset($settings['username'], $settings['password'])) {
+                $options['auth'] = $settings['username'] . ':' . $settings['password'];
+            }
+        }
+    }
 }
 
 function flattenReportConfig(array $reports, array &$options): void {
@@ -995,6 +1042,86 @@ function headersFromOptions(array $options): array {
     return $headers;
 }
 
+function authHeadersFromSchema(array $schema, array $options): array {
+    $headers = [];
+    $schemes = $schema['components']['securitySchemes'] ?? [];
+    foreach ($schemes as $name => $scheme) {
+        if (!is_array($scheme)) continue;
+        $type = strtolower((string)($scheme['type'] ?? ''));
+        $httpScheme = strtolower((string)($scheme['scheme'] ?? ''));
+        if ($type === 'http' && $httpScheme === 'bearer' && isset($options['auth-token'])) {
+            $headers[] = 'Authorization: Bearer ' . (string)$options['auth-token'];
+        } elseif ($type === 'http' && $httpScheme === 'basic' && isset($options['auth']) && !hasHeader($headers, 'authorization')) {
+            $headers[] = 'Authorization: Basic ' . base64_encode((string)$options['auth']);
+        } elseif ($type === 'apikey' && strtolower((string)($scheme['in'] ?? '')) === 'header') {
+            $apiKey = apiKeyValueForScheme($name, $options);
+            if ($apiKey !== null) $headers[] = ($scheme['name'] ?? $name) . ': ' . $apiKey;
+        }
+    }
+    return $headers;
+}
+
+function apiKeyValueForScheme(string $schemeName, array $options): ?string {
+    foreach (optionValues($options, 'auth-api-key') as $entry) {
+        if (str_contains($entry, ':')) {
+            [$name, $value] = explode(':', $entry, 2);
+            if ($name === $schemeName) return $value;
+        } elseif ($entry !== '') {
+            return $entry;
+        }
+    }
+    return null;
+}
+
+function mergeHeaders(array ...$headerSets): array {
+    $merged = [];
+    foreach ($headerSets as $headers) {
+        foreach ($headers as $header) {
+            if (!str_contains((string)$header, ':')) continue;
+            [$name] = explode(':', (string)$header, 2);
+            $merged[strtolower(trim($name))] = trim((string)$header);
+        }
+    }
+    return array_values($merged);
+}
+
+function stripSecurityHeaders(array $headers, array $schema): array {
+    $securityHeaderNames = ['authorization'];
+    foreach (($schema['components']['securitySchemes'] ?? []) as $scheme) {
+        if (is_array($scheme) && strtolower((string)($scheme['type'] ?? '')) === 'apikey' && strtolower((string)($scheme['in'] ?? '')) === 'header') {
+            $securityHeaderNames[] = strtolower((string)($scheme['name'] ?? ''));
+        }
+    }
+    return array_values(array_filter($headers, function($header) use ($securityHeaderNames): bool {
+        if (!str_contains((string)$header, ':')) return true;
+        [$name] = explode(':', (string)$header, 2);
+        return !in_array(strtolower(trim($name)), $securityHeaderNames, true);
+    }));
+}
+
+function invalidSecurityHeaders(array $schema): array {
+    $headers = [];
+    foreach (($schema['components']['securitySchemes'] ?? []) as $name => $scheme) {
+        if (!is_array($scheme)) continue;
+        $type = strtolower((string)($scheme['type'] ?? ''));
+        $httpScheme = strtolower((string)($scheme['scheme'] ?? ''));
+        if ($type === 'http' && $httpScheme === 'bearer') $headers[] = 'Authorization: Bearer invalid-token';
+        elseif ($type === 'http' && $httpScheme === 'basic') $headers[] = 'Authorization: Basic ' . base64_encode('invalid:invalid');
+        elseif ($type === 'apikey' && strtolower((string)($scheme['in'] ?? '')) === 'header') $headers[] = ($scheme['name'] ?? $name) . ': invalid';
+    }
+    return $headers;
+}
+
+function apiKeyCookieHeaders(array $schema, array $options): array {
+    $cookies = [];
+    foreach (($schema['components']['securitySchemes'] ?? []) as $schemeName => $scheme) {
+        if (!is_array($scheme) || strtolower((string)($scheme['type'] ?? '')) !== 'apikey' || strtolower((string)($scheme['in'] ?? '')) !== 'cookie') continue;
+        $value = apiKeyValueForScheme((string)$schemeName, $options);
+        if ($value !== null) $cookies[] = rawurlencode((string)($scheme['name'] ?? $schemeName)) . '=' . rawurlencode($value);
+    }
+    return $cookies ? ['Cookie: ' . implode('; ', $cookies)] : [];
+}
+
 function hasHeader(array $headers, string $name): bool {
     $prefix = strtolower($name) . ':';
     foreach ($headers as $header) {
@@ -1033,6 +1160,12 @@ function parseTlsVerify($value) {
     };
 }
 
+function parseBooleanOption($value): bool {
+    if ($value === true || $value === null) return true;
+    if ($value === false) return false;
+    return !in_array(strtolower(trim((string)$value)), ['false', '0', 'no', 'off'], true);
+}
+
 function parseRateLimit(string $value): ?float {
     if (!preg_match('/^\s*(\d+(?:\.\d+)?)\s*\/\s*([smh])\s*$/i', $value, $match)) return null;
     $limit = (float)$match[1];
@@ -1050,10 +1183,10 @@ function addCompatibilityWarnings(array $options, array $phases, array $checks, 
         $warnings[] = "Check '{$check}' is accepted but is not implemented yet.";
     }
     if (in_array('stateful', $phases, true)) {
-        $warnings[] = "Stateful testing currently runs a linear workflow; link-based workflow extraction is not implemented yet.";
+        $warnings[] = "Stateful testing uses explicit links, Location headers, and simple dependency inference; complex workflows may need schema links.";
     }
     if (isset($options['workers']) && (string)$options['workers'] !== '1') {
-        $warnings[] = "--workers is accepted but execution is currently sequential.";
+        $warnings[] = "--workers is accepted for config compatibility; this dependency-free runner still executes HTTP calls sequentially.";
     }
     if ($command === 'fuzz' && !isset($options['max-time']) && !isset($options['max-examples'])) {
         $warnings[] = "fuzz currently runs 100 examples per operation by default; pass --max-time for time-bounded fuzzing.";
@@ -1062,18 +1195,16 @@ function addCompatibilityWarnings(array $options, array $phases, array $checks, 
         $warnings[] = "--generation-deterministic is accepted; use --seed for current reproducibility.";
     }
     foreach ([
-        'no-shrink' => 'shrinking',
         'generation-maximize' => 'targeted generation',
         'generation-database' => 'example database persistence',
-        'generation-unique-inputs' => 'unique-input filtering',
-        'generation-graphql-allow-null' => 'GraphQL generation'
+        'generation-unique-inputs' => 'unique-input filtering'
     ] as $option => $feature) {
         if (isset($options[$option])) {
             $warnings[] = "--{$option} is accepted, but {$feature} is not implemented yet.";
         }
     }
-    if (!str_starts_with((string)($schema['openapi'] ?? ''), '3.')) {
-        $warnings[] = "Only OpenAPI 3.x JSON is actively supported by this runner today.";
+    if (($schema['x-graphql'] ?? false) === true) {
+        $warnings[] = "GraphQL SDL support covers simple Query and Mutation fields over a JSON HTTP endpoint.";
     }
 }
 
@@ -1107,7 +1238,7 @@ function loadSchemaOnce(string $location, float $timeout, array $transport = [])
     }
     $schema = decodeSchemaDocument((string)$json, $location);
     if (!is_array($schema)) throw new RuntimeException('schema is not a supported JSON or YAML object');
-    return $schema;
+    return normalizeSchemaDocument($schema, $location);
 }
 
 function decodeSchemaDocument(string $document, string $location): array {
@@ -1124,7 +1255,202 @@ function decodeSchemaDocument(string $document, string $location): array {
         if (is_array($yaml)) return $yaml;
     }
 
+    if (preg_match('/\.(gql|graphql)$/i', parse_url($location, PHP_URL_PATH) ?? $location)) {
+        return parseGraphqlSchema($document);
+    }
+
     throw new RuntimeException('schema is not valid JSON and could not be parsed as YAML');
+}
+
+function normalizeSchemaDocument(array $schema, string $location): array {
+    if (isset($schema['x-graphql'])) return $schema;
+    if (isset($schema['swagger']) && str_starts_with((string)$schema['swagger'], '2.')) {
+        return normalizeSwagger2($schema);
+    }
+    if (!isset($schema['openapi'])) {
+        throw new RuntimeException('schema is missing openapi or swagger version');
+    }
+    $schema['x-specification'] = 'OpenAPI ' . (string)$schema['openapi'];
+    return $schema;
+}
+
+function normalizeSwagger2(array $schema): array {
+    $scheme = $schema['schemes'][0] ?? 'http';
+    $host = $schema['host'] ?? 'localhost';
+    $basePath = $schema['basePath'] ?? '';
+    $serverUrl = $scheme . '://' . $host . rtrim((string)$basePath, '/');
+    $normalized = [
+        'openapi' => '3.0.0',
+        'x-source-specification' => 'Swagger ' . (string)($schema['swagger'] ?? '2.0'),
+        'x-specification' => 'Swagger ' . (string)($schema['swagger'] ?? '2.0'),
+        'info' => $schema['info'] ?? ['title' => 'API', 'version' => 'unknown'],
+        'servers' => [['url' => $serverUrl]],
+        'paths' => [],
+        'components' => [
+            'schemas' => $schema['definitions'] ?? [],
+            'parameters' => $schema['parameters'] ?? [],
+            'responses' => $schema['responses'] ?? [],
+            'securitySchemes' => normalizeSwagger2SecuritySchemes($schema['securityDefinitions'] ?? [])
+        ],
+        'security' => $schema['security'] ?? []
+    ];
+
+    foreach (($schema['paths'] ?? []) as $path => $pathItem) {
+        if (!is_array($pathItem)) continue;
+        $normalizedPathItem = [];
+        if (isset($pathItem['parameters'])) $normalizedPathItem['parameters'] = $pathItem['parameters'];
+        foreach (HTTP_OPERATION_METHODS as $method) {
+            if (!isset($pathItem[$method]) || !is_array($pathItem[$method])) continue;
+            $operation = $pathItem[$method];
+            $operation['responses'] = normalizeSwagger2Responses($operation['responses'] ?? [], $operation['produces'] ?? $schema['produces'] ?? ['application/json']);
+            $operation = normalizeSwagger2RequestBody($operation, $operation['consumes'] ?? $schema['consumes'] ?? ['application/json']);
+            $normalizedPathItem[$method] = $operation;
+        }
+        $normalized['paths'][$path] = $normalizedPathItem;
+    }
+
+    return $normalized;
+}
+
+function normalizeSwagger2SecuritySchemes(array $definitions): array {
+    $schemes = [];
+    foreach ($definitions as $name => $definition) {
+        if (!is_array($definition)) continue;
+        $type = $definition['type'] ?? '';
+        if ($type === 'apiKey') {
+            $schemes[$name] = ['type' => 'apiKey', 'name' => $definition['name'] ?? $name, 'in' => $definition['in'] ?? 'header'];
+        } elseif ($type === 'basic') {
+            $schemes[$name] = ['type' => 'http', 'scheme' => 'basic'];
+        } elseif ($type === 'oauth2') {
+            $schemes[$name] = ['type' => 'oauth2', 'flows' => []];
+        }
+    }
+    return $schemes;
+}
+
+function normalizeSwagger2Responses(array $responses, array $produces): array {
+    $normalized = [];
+    foreach ($responses as $status => $response) {
+        if (!is_array($response)) continue;
+        if (isset($response['schema'])) {
+            $mediaType = $produces[0] ?? 'application/json';
+            $response['content'][$mediaType]['schema'] = $response['schema'];
+            unset($response['schema']);
+        }
+        $normalized[(string)$status] = $response;
+    }
+    return $normalized;
+}
+
+function normalizeSwagger2RequestBody(array $operation, array $consumes): array {
+    $parameters = [];
+    $bodyParameter = null;
+    $formProperties = [];
+    $formRequired = [];
+    foreach (($operation['parameters'] ?? []) as $parameter) {
+        if (!is_array($parameter)) continue;
+        if (($parameter['in'] ?? '') === 'body') {
+            $bodyParameter = $parameter;
+            continue;
+        }
+        if (($parameter['in'] ?? '') === 'formData') {
+            $name = (string)($parameter['name'] ?? 'field');
+            $formProperties[$name] = schemaFromParameter($parameter);
+            if (($parameter['required'] ?? false) === true) $formRequired[] = $name;
+            continue;
+        }
+        $parameters[] = $parameter;
+    }
+    $operation['parameters'] = $parameters;
+    if ($bodyParameter !== null) {
+        $mediaType = $consumes[0] ?? 'application/json';
+        $operation['requestBody'] = [
+            'required' => (bool)($bodyParameter['required'] ?? false),
+            'content' => [
+                $mediaType => ['schema' => $bodyParameter['schema'] ?? ['type' => 'object']]
+            ]
+        ];
+    } elseif ($formProperties) {
+        $mediaType = in_array('multipart/form-data', $consumes, true) ? 'multipart/form-data' : 'application/x-www-form-urlencoded';
+        $schema = ['type' => 'object', 'properties' => $formProperties];
+        if ($formRequired) $schema['required'] = $formRequired;
+        $operation['requestBody'] = ['required' => true, 'content' => [$mediaType => ['schema' => $schema]]];
+    }
+    return $operation;
+}
+
+function schemaFromParameter(array $parameter): array {
+    if (isset($parameter['schema']) && is_array($parameter['schema'])) return $parameter['schema'];
+    $schema = ['type' => $parameter['type'] ?? 'string'];
+    foreach (['format', 'items', 'enum', 'minimum', 'maximum', 'minLength', 'maxLength', 'pattern'] as $key) {
+        if (isset($parameter[$key])) $schema[$key] = $parameter[$key];
+    }
+    return $schema;
+}
+
+function parseGraphqlSchema(string $document): array {
+    $types = parseGraphqlTypes($document);
+    $paths = [];
+    foreach (['Query' => 'query', 'Mutation' => 'mutation'] as $typeName => $operationType) {
+        foreach (($types[$typeName] ?? []) as $field => $definition) {
+            $operationId = $operationType . ucfirst($field);
+            $paths["/__graphql/{$operationId}"]['post'] = [
+                'operationId' => $operationId,
+                'tags' => [$operationType],
+                'x-graphql-endpoint-path' => '',
+                'x-graphql-field' => $field,
+                'x-graphql-operation' => $operationType,
+                'x-graphql-args' => $definition['args'],
+                'x-graphql-return' => $definition['return'],
+                'x-graphql-types' => $types,
+                'requestBody' => ['content' => ['application/json' => ['schema' => ['type' => 'object']]]],
+                'responses' => [
+                    '200' => [
+                        'description' => 'GraphQL response',
+                        'content' => ['application/json' => ['schema' => ['type' => 'object']]]
+                    ]
+                ]
+            ];
+        }
+    }
+    return [
+        'openapi' => '3.0.0',
+        'x-graphql' => true,
+        'x-specification' => 'GraphQL SDL',
+        'servers' => [],
+        'paths' => $paths,
+        'components' => ['schemas' => []]
+    ];
+}
+
+function parseGraphqlTypes(string $document): array {
+    $types = [];
+    if (!preg_match_all('/type\s+(\w+)\s*\{([^}]*)\}/s', $document, $matches, PREG_SET_ORDER)) return $types;
+    foreach ($matches as $match) {
+        $typeName = $match[1];
+        $fields = [];
+        foreach (preg_split('/\r\n|\n|\r/', trim($match[2])) ?: [] as $line) {
+            $line = trim(preg_replace('/#.*/', '', $line));
+            if ($line === '' || !str_contains($line, ':')) continue;
+            if (!preg_match('/^(\w+)\s*(?:\(([^)]*)\))?\s*:\s*([!\[\]\w]+)/', $line, $fieldMatch)) continue;
+            $fields[$fieldMatch[1]] = [
+                'args' => parseGraphqlArgs($fieldMatch[2] ?? ''),
+                'return' => trim($fieldMatch[3])
+            ];
+        }
+        $types[$typeName] = $fields;
+    }
+    return $types;
+}
+
+function parseGraphqlArgs(string $args): array {
+    $result = [];
+    foreach (array_filter(array_map('trim', explode(',', $args))) as $arg) {
+        if (!str_contains($arg, ':')) continue;
+        [$name, $type] = array_map('trim', explode(':', $arg, 2));
+        $result[$name] = $type;
+    }
+    return $result;
 }
 
 function parseSimpleYaml(string $document): array {
@@ -1266,27 +1592,59 @@ function httpRequest(string $method, string $url, array $headers, ?string $body,
 
 function baseUrlFromSchema(array $schema, ?string $override): string {
     if ($override) return rtrim($override, '/');
+    if (($schema['x-graphql'] ?? false) === true) throw new RuntimeException('GraphQL SDL has no server URL; pass --url with the GraphQL endpoint');
     $server = $schema['servers'][0]['url'] ?? null;
     if (!$server) throw new RuntimeException('schema has no servers[0].url; pass --url');
     return rtrim((string)$server, '/');
 }
 
+function specificationLabel(array $schema): string {
+    if (isset($schema['x-specification'])) return (string)$schema['x-specification'];
+    if (isset($schema['openapi'])) return 'OpenAPI ' . (string)$schema['openapi'];
+    if (isset($schema['swagger'])) return 'Swagger ' . (string)$schema['swagger'];
+    return 'unknown';
+}
+
 function collectOperations(array $schema): array {
     $operations = [];
+    $components = $schema['components'] ?? [];
     foreach (($schema['paths'] ?? []) as $path => $pathItem) {
         if (!is_array($pathItem)) continue;
+        $pathParameters = array_values(array_filter($pathItem['parameters'] ?? [], 'is_array'));
         foreach (HTTP_OPERATION_METHODS as $method) {
             if (!isset($pathItem[$method]) || !is_array($pathItem[$method])) continue;
+            $operation = $pathItem[$method];
+            $operation['parameters'] = mergeOperationParameters($pathParameters, array_values(array_filter($operation['parameters'] ?? [], 'is_array')), $components);
             $operations[] = [
                 'method' => strtoupper($method),
                 'method_key' => $method,
                 'path' => $path,
                 'path_item' => $pathItem,
-                'operation' => $pathItem[$method]
+                'operation' => $operation
             ];
         }
     }
     return $operations;
+}
+
+function mergeOperationParameters(array $pathParameters, array $operationParameters, array $components): array {
+    $merged = [];
+    foreach (array_merge($pathParameters, $operationParameters) as $parameter) {
+        $parameter = resolveParameterRef($parameter, $components);
+        $key = ($parameter['in'] ?? '') . ':' . ($parameter['name'] ?? '');
+        if ($key === ':') continue;
+        $merged[$key] = $parameter;
+    }
+    return array_values($merged);
+}
+
+function resolveParameterRef(array $parameter, array $components): array {
+    if (!isset($parameter['$ref'])) return $parameter;
+    $prefix = '#/components/parameters/';
+    $ref = (string)$parameter['$ref'];
+    if (!str_starts_with($ref, $prefix)) return $parameter;
+    $name = substr($ref, strlen($prefix));
+    return $components['parameters'][$name] ?? $parameter;
 }
 
 function filterOperations(array $operations, array $options, array &$warnings): array {
@@ -1300,7 +1658,7 @@ function filterOperations(array $operations, array $options, array &$warnings): 
 function operationIncluded(array $operation, array $options, array &$warnings): bool {
     if (($options['exclude-deprecated'] ?? false) && ($operation['operation']['deprecated'] ?? false)) return false;
 
-    foreach (['path', 'method', 'tag', 'operation-id'] as $type) {
+    foreach (['path', 'method', 'name', 'tag', 'operation-id'] as $type) {
         $include = optionValues($options, "include-{$type}");
         if ($include && !operationMatchesAny($operation, $type, $include, false, $warnings)) return false;
 
@@ -1355,6 +1713,7 @@ function operationFilterValues(array $operation, string $type): array {
     return match ($type) {
         'path' => [$operation['path']],
         'method' => [$operation['method']],
+        'name' => [$operation['method'] . ' ' . $operation['path']],
         'tag' => array_map('strval', $operation['operation']['tags'] ?? []),
         'operation-id' => isset($operation['operation']['operationId']) ? [(string)$operation['operation']['operationId']] : [],
         default => []
@@ -1397,7 +1756,7 @@ function jsonPointer($document, string $pointer) {
 function runExamplesPhase(array $operations, array &$state): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
     foreach ($operations as $operation) {
-        runCase($operation, $state, 'examples', exampleRequestBody($operation['operation']), true, $result);
+        runCase($operation, $state, 'examples', requestBodyPayload($operation['operation'], $state['components'], 'positive', true), true, $result);
         if (failureLimitReached($state)) break;
     }
     return $result;
@@ -1406,8 +1765,10 @@ function runExamplesPhase(array $operations, array &$state): array {
 function runCoveragePhase(array $operations, array &$state): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
     foreach ($operations as $operation) {
-        runCase($operation, $state, 'coverage', exampleRequestBody($operation['operation']), true, $result);
+        runCase($operation, $state, 'coverage', requestBodyPayload($operation['operation'], $state['components'], 'positive', true), true, $result);
         if (!failureLimitReached($state)) runInvalidPathCase($operation, $state, $result);
+        if (!failureLimitReached($state)) runMissingRequiredHeaderCases($operation, $state, $result);
+        if (!failureLimitReached($state)) runIgnoredAuthCases($operation, $state, $result);
         if (!failureLimitReached($state)) runUnsupportedMethodCase($operation, $state, $result);
         if (failureLimitReached($state)) break;
     }
@@ -1429,7 +1790,7 @@ function runFuzzingPhase(array $operations, array &$state, int $maxExamples, ?fl
                     $result['skipped']++;
                     continue;
                 }
-                runCase($operation, $state, 'fuzzing', generatedRequestBody($operation['operation'], $state['components'], $mode), false, $result, $mode);
+                runCase($operation, $state, 'fuzzing', requestBodyPayload($operation['operation'], $state['components'], $mode, false), false, $result, $mode);
                 if (failureLimitReached($state)) break 3;
                 if ($deadline !== null && microtime(true) >= $deadline) break 3;
             }
@@ -1449,14 +1810,177 @@ function operationHasInput(array $operation): bool {
 function runStatefulPhase(array $operations, array &$state, int $maxExamples, ?float $deadline = null): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
     $iterations = max(1, min($maxExamples, 25));
+    $orderedOperations = orderStatefulOperations($operations);
     for ($i = 0; $i < $iterations; $i++) {
-        foreach ($operations as $operation) {
+        foreach ($orderedOperations as $operation) {
             if ($deadline !== null && microtime(true) >= $deadline) return $result;
-            runCase($operation, $state, 'stateful', generatedRequestBody($operation['operation'], $state['components'], 'positive'), false, $result, 'positive');
+            $context = statefulContextForOperation($operation, $state);
+            $case = runCase($operation, $state, 'stateful', requestBodyPayload($operation['operation'], $state['components'], 'positive', false), false, $result, 'positive', $context);
+            if ($case !== null) {
+                runEnsureResourceAvailabilityChecks($operation, $case, $operations, $state, $result);
+                runUseAfterFreeChecks($operation, $case, $operations, $state, $result, $context);
+            }
             if (failureLimitReached($state)) return $result;
         }
     }
     return $result;
+}
+
+function orderStatefulOperations(array $operations): array {
+    $rank = ['POST' => 0, 'PUT' => 1, 'PATCH' => 2, 'GET' => 3, 'DELETE' => 4];
+    usort($operations, fn(array $a, array $b): int => ($rank[$a['method']] ?? 9) <=> ($rank[$b['method']] ?? 9));
+    return $operations;
+}
+
+function statefulContextForOperation(array $operation, array $state): array {
+    $pathParameters = [];
+    $queryParameters = [];
+    foreach (operationParameters($operation['operation']) as $parameter) {
+        $name = (string)($parameter['name'] ?? '');
+        if ($name === '') continue;
+        $value = resourceValueForParameter($name, $state);
+        if ($value === null) continue;
+        if (($parameter['in'] ?? '') === 'path') $pathParameters[$name] = $value;
+        elseif (($parameter['in'] ?? '') === 'query') $queryParameters[$name] = $value;
+    }
+    return ['path_parameters' => $pathParameters, 'query_parameters' => $queryParameters];
+}
+
+function resourceValueForParameter(string $name, array $state) {
+    $candidates = parameterResourceNames($name);
+    foreach ($candidates as $candidate) {
+        if (!empty($state['resource_values'][$candidate])) return end($state['resource_values'][$candidate]);
+    }
+    return null;
+}
+
+function parameterResourceNames(string $name): array {
+    $normalized = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $name));
+    $names = [$name, $normalized];
+    if (str_ends_with($normalized, 'id')) {
+        $names[] = 'id';
+        $names[] = substr($normalized, 0, -2) . 'id';
+    }
+    return array_values(array_unique(array_filter($names)));
+}
+
+function runEnsureResourceAvailabilityChecks(array $producer, array $case, array $operations, array &$state, array &$result): void {
+    if (!in_array('ensure_resource_availability', $state['checks'], true)) return;
+    if ($producer['method'] !== 'POST' || !isSuccessfulResponse($case['response'] ?? null)) return;
+    foreach (linkedGetOperations($producer, $case, $operations, $state) as [$consumer, $context]) {
+        executeProbeCase(
+            $consumer,
+            $state,
+            'stateful',
+            requestBodyPayload($consumer['operation'], $state['components'], 'positive', false),
+            false,
+            'positive',
+            $context,
+            function(array $response) use ($consumer): ?string {
+                return $response['status'] === 404
+                    ? "created resource was not available through {$consumer['method']} {$consumer['path']}"
+                    : null;
+            },
+            $result
+        );
+        if (failureLimitReached($state)) return;
+    }
+}
+
+function runUseAfterFreeChecks(array $operation, array $case, array $operations, array &$state, array &$result, array $context): void {
+    if (!in_array('use_after_free', $state['checks'], true)) return;
+    if ($operation['method'] !== 'DELETE' || !isSuccessfulResponse($case['response'] ?? null)) return;
+    $reader = findOperation($operations, 'GET', $operation['path']);
+    if ($reader === null) return;
+    executeProbeCase(
+        $reader,
+        $state,
+        'stateful',
+        requestBodyPayload($reader['operation'], $state['components'], 'positive', false),
+        false,
+        'positive',
+        $context,
+        function(array $response) use ($reader): ?string {
+            return $response['status'] === 404
+                ? null
+                : "deleted resource remained available through {$reader['method']} {$reader['path']} with HTTP {$response['status']}";
+        },
+        $result
+    );
+}
+
+function linkedGetOperations(array $producer, array $case, array $operations, array $state): array {
+    $linked = [];
+    $location = $case['response']['headers']['location'] ?? null;
+    if (is_string($location)) {
+        foreach ($operations as $operation) {
+            if ($operation['method'] !== 'GET') continue;
+            $params = parametersFromConcretePath(parse_url($location, PHP_URL_PATH) ?: $location, $operation['path']);
+            if ($params !== null) $linked[] = [$operation, ['path_parameters' => $params]];
+        }
+    }
+
+    $sourceOperationId = $producer['operation']['operationId'] ?? null;
+    foreach (($state['stateful_links'][$sourceOperationId] ?? []) as $link) {
+        $target = findOperationById($operations, $link['operationId'] ?? '');
+        if ($target === null || $target['method'] !== 'GET') continue;
+        $params = [];
+        foreach (($link['parameters'] ?? []) as $name => $expression) {
+            $params[(string)$name] = extractLinkValue($expression, $case);
+        }
+        $linked[] = [$target, ['path_parameters' => array_filter($params, fn($value) => $value !== null)]];
+    }
+
+    if (!$linked) {
+        foreach ($operations as $operation) {
+            if ($operation['method'] !== 'GET') continue;
+            $context = statefulContextForOperation($operation, $state);
+            if (($context['path_parameters'] ?? []) || ($context['query_parameters'] ?? [])) $linked[] = [$operation, $context];
+        }
+    }
+    return $linked;
+}
+
+function parametersFromConcretePath(string $actualPath, string $template): ?array {
+    $names = [];
+    $pattern = '';
+    $offset = 0;
+    while (preg_match('/\{([^}]+)\}/', $template, $match, PREG_OFFSET_CAPTURE, $offset)) {
+        $start = $match[0][1];
+        $pattern .= preg_quote(substr($template, $offset, $start - $offset), '#');
+        $name = $match[1][0];
+        $key = preg_replace('/\W/', '_', $name);
+        $names[$key] = $name;
+        $pattern .= '(?P<' . $key . '>[^/]+)';
+        $offset = $start + strlen($match[0][0]);
+    }
+    $pattern .= preg_quote(substr($template, $offset), '#');
+    $pattern = '#^' . $pattern . '$#';
+    if (!preg_match($pattern, $actualPath, $matches)) return null;
+    $params = [];
+    foreach ($names as $key => $name) {
+        if (isset($matches[$key])) $params[$name] = rawurldecode($matches[$key]);
+    }
+    return $params;
+}
+
+function findOperation(array $operations, string $method, string $path): ?array {
+    foreach ($operations as $operation) {
+        if ($operation['method'] === $method && $operation['path'] === $path) return $operation;
+    }
+    return null;
+}
+
+function findOperationById(array $operations, string $operationId): ?array {
+    foreach ($operations as $operation) {
+        if (($operation['operation']['operationId'] ?? null) === $operationId) return $operation;
+    }
+    return null;
+}
+
+function isSuccessfulResponse(?array $response): bool {
+    $status = (int)($response['status'] ?? 0);
+    return $status >= 200 && $status < 300;
 }
 
 function exampleRequestBody(array $operation): ?string {
@@ -1467,22 +1991,139 @@ function exampleRequestBody(array $operation): ?string {
 }
 
 function generatedRequestBody(array $operation, array $components, string $mode = 'positive'): ?string {
-    $json = $operation['requestBody']['content']['application/json'] ?? null;
-    if (!$json) return null;
-    $schema = $json['schema'] ?? ['type' => 'object'];
-    $value = $mode === 'negative' ? generateInvalidValue($schema, $components) : generateValue($schema, $components);
-    return json_encode($value);
+    return requestBodyPayload($operation, $components, $mode, false)['body'];
 }
 
-function runCase(array $op, array &$state, string $phase, ?string $body, bool $useExamples, array &$result, string $caseMode = 'positive'): void {
+function requestBodyPayload(array $operation, array $components, string $mode, bool $useExamples): array {
+    if (isset($operation['x-graphql-field'])) {
+        return [
+            'body' => json_encode(['query' => graphqlQueryForOperation($operation, $components, $mode)]),
+            'content_type' => 'application/json'
+        ];
+    }
+
+    $content = $operation['requestBody']['content'] ?? [];
+    if (!is_array($content) || !$content) return ['body' => null, 'content_type' => null];
+    [$mediaType, $media] = selectRequestMediaType($content);
+    $schema = is_array($media) ? ($media['schema'] ?? ['type' => 'object']) : ['type' => 'object'];
+
+    if ($useExamples && is_array($media) && array_key_exists('example', $media)) {
+        $value = $media['example'];
+    } elseif ($useExamples && is_array($media) && isset($media['examples']) && is_array($media['examples']) && $media['examples']) {
+        $example = reset($media['examples']);
+        $value = is_array($example) && array_key_exists('value', $example) ? $example['value'] : $example;
+    } else {
+        $value = $mode === 'negative' ? generateInvalidValue($schema, $components) : generateValue($schema, $components);
+    }
+
+    if (isJsonMediaType($mediaType)) {
+        return ['body' => json_encode($value), 'content_type' => $mediaType];
+    }
+    if ($mediaType === 'application/x-www-form-urlencoded') {
+        return ['body' => http_build_query(is_array($value) ? $value : ['value' => $value]), 'content_type' => $mediaType];
+    }
+    if ($mediaType === 'multipart/form-data') {
+        return multipartPayload(is_array($value) ? $value : ['value' => $value]);
+    }
+    if (str_starts_with($mediaType, 'text/')) {
+        return ['body' => scalarParameterValue($value), 'content_type' => $mediaType];
+    }
+    if ($mediaType === 'application/octet-stream') {
+        return ['body' => is_string($value) ? $value : random_bytes(8), 'content_type' => $mediaType];
+    }
+    return ['body' => is_string($value) ? $value : json_encode($value), 'content_type' => $mediaType];
+}
+
+function normalizePayload($payload): array {
+    if (is_array($payload) && array_key_exists('body', $payload)) {
+        return ['body' => $payload['body'], 'content_type' => $payload['content_type'] ?? null];
+    }
+    return ['body' => $payload, 'content_type' => $payload === null ? null : 'application/json'];
+}
+
+function selectRequestMediaType(array $content): array {
+    foreach (['application/json', 'application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain', 'application/octet-stream'] as $preferred) {
+        if (isset($content[$preferred])) return [$preferred, $content[$preferred]];
+    }
+    foreach ($content as $mediaType => $media) return [(string)$mediaType, $media];
+    return ['application/json', ['schema' => ['type' => 'object']]];
+}
+
+function isJsonMediaType(string $mediaType): bool {
+    if (in_array(strtolower($mediaType), JSON_MEDIA_TYPES, true)) return true;
+    return str_ends_with(strtolower($mediaType), '+json');
+}
+
+function multipartPayload(array $fields): array {
+    $boundary = '----openapi-contract-' . bin2hex(random_bytes(8));
+    $lines = [];
+    foreach ($fields as $name => $value) {
+        $lines[] = "--{$boundary}";
+        $lines[] = 'Content-Disposition: form-data; name="' . addcslashes((string)$name, '"\\') . '"';
+        $lines[] = '';
+        $lines[] = scalarParameterValue($value);
+    }
+    $lines[] = "--{$boundary}--";
+    return ['body' => implode("\r\n", $lines) . "\r\n", 'content_type' => 'multipart/form-data; boundary=' . $boundary];
+}
+
+function graphqlQueryForOperation(array $operation, array $components, string $mode): string {
+    $operationType = (string)($operation['x-graphql-operation'] ?? 'query');
+    $field = (string)($operation['x-graphql-field'] ?? 'field');
+    $args = [];
+    foreach (($operation['x-graphql-args'] ?? []) as $name => $type) {
+        $args[] = $name . ': ' . graphqlLiteral(graphqlValueForType((string)$type, $mode));
+    }
+    $selection = graphqlSelectionForType((string)($operation['x-graphql-return'] ?? 'String'), $operation['x-graphql-types'] ?? []);
+    return trim($operationType . ' { ' . $field . ($args ? '(' . implode(', ', $args) . ')' : '') . $selection . ' }');
+}
+
+function graphqlValueForType(string $type, string $mode) {
+    $clean = trim($type, "[]! \t\n\r\0\x0B");
+    if ($mode === 'negative') return match ($clean) {
+        'Int', 'Float', 'Boolean', 'ID' => '"invalid"',
+        default => 12345
+    };
+    return match ($clean) {
+        'Int' => mt_rand(1, 100),
+        'Float' => mt_rand(1, 100) / 10,
+        'Boolean' => (bool)mt_rand(0, 1),
+        'ID' => (string)mt_rand(1, 100),
+        default => 'value' . mt_rand(1, 100)
+    };
+}
+
+function graphqlLiteral($value): string {
+    if (is_bool($value)) return $value ? 'true' : 'false';
+    if (is_int($value) || is_float($value)) return (string)$value;
+    return json_encode((string)$value);
+}
+
+function graphqlSelectionForType(string $type, array $types): string {
+    $clean = trim($type, "[]! \t\n\r\0\x0B");
+    if (!isset($types[$clean]) || in_array($clean, ['String', 'ID', 'Int', 'Float', 'Boolean'], true)) return '';
+    $fields = [];
+    foreach ($types[$clean] as $name => $definition) {
+        $return = trim((string)($definition['return'] ?? ''), "[]! \t\n\r\0\x0B");
+        if (in_array($return, ['String', 'ID', 'Int', 'Float', 'Boolean'], true)) $fields[] = $name;
+        if (count($fields) >= 5) break;
+    }
+    return $fields ? ' { ' . implode(' ', $fields) . ' }' : ' { __typename }';
+}
+
+function runCase(array $op, array &$state, string $phase, $payload, bool $useExamples, array &$result, string $caseMode = 'positive', array $context = []): ?array {
     $method = $op['method'];
-    $path = concretePath($op['path'], $op['operation'], $useExamples);
-    $query = queryString($op['operation'], $state['components'], $useExamples, $caseMode);
+    $payload = normalizePayload($payload);
+    $path = concretePath($op['path'], $op['operation'], $useExamples, $state['components'], $context['path_parameters'] ?? []);
+    if (isset($op['operation']['x-graphql-endpoint-path'])) $path = (string)$op['operation']['x-graphql-endpoint-path'];
+    $query = queryString($op['operation'], $state['components'], $useExamples, $caseMode, $context['query_parameters'] ?? [], $state['schema'], $state['options']);
     $pathQuery = $path . $query;
     $url = $state['base_url'] . $pathQuery;
-    $headers = $state['headers'];
-    foreach (operationParameterHeaders($op['operation'], $state['components'], $useExamples, $caseMode) as $header) $headers[] = $header;
-    if ($body !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: application/json';
+    $headers = $context['headers'] ?? $state['headers'];
+    foreach (operationParameterHeaders($op['operation'], $state['components'], $useExamples, $caseMode, $context['skip_headers'] ?? []) as $header) $headers[] = $header;
+    foreach (apiKeyCookieHeaders($state['schema'], $state['options']) as $header) $headers[] = $header;
+    if ($payload['body'] !== null && $payload['content_type'] !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: ' . $payload['content_type'];
+    $body = $payload['body'];
     $request = buildRequestRecord($phase, $op, $method, $url, $pathQuery, $headers, $body, $caseMode);
 
     try {
@@ -1490,26 +2131,89 @@ function runCase(array $op, array &$state, string $phase, ?string $body, bool $u
     } catch (Throwable $e) {
         $case = recordCase($state, $request, null, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}");
         recordFailure($state, $result, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}", $case);
-        return;
+        return $case;
     }
 
     $state['cases']++;
     $failure = validateResponse($op, $response, $state['components'], $state['checks'], $state['max_response_time'], $caseMode);
+    if ($failure && $caseMode === 'positive' && $phase === 'fuzzing' && !($state['options']['no-shrink'] ?? false)) {
+        [$body, $response, $failure] = shrinkFailingPayload($op, $state, $headers, $pathQuery, $payload, $response, $failure, $caseMode);
+        $request['body'] = $body;
+    }
     $case = recordCase($state, $request, $response, $failure);
+    learnFromCase($state, $case);
     if ($failure) {
         recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}", $case);
     } else {
         $result['passed']++;
     }
+    return $case;
+}
+
+function shrinkFailingPayload(array $op, array &$state, array $headers, string $pathQuery, array $payload, array $currentResponse, string $currentFailure, string $caseMode): array {
+    if ($payload['body'] === null || !isset($payload['content_type']) || !isJsonMediaType((string)$payload['content_type'])) {
+        return [$payload['body'], $currentResponse, $currentFailure];
+    }
+    $decoded = json_decode((string)$payload['body'], true);
+    if (!is_array($decoded)) return [$payload['body'], $currentResponse, $currentFailure];
+    $bestBody = (string)$payload['body'];
+    $bestResponse = $currentResponse;
+    $bestFailure = $currentFailure;
+    foreach (shrinkCandidates($decoded) as $candidate) {
+        $body = json_encode($candidate);
+        try {
+            $response = requestWithState($op['method'], $state['base_url'] . $pathQuery, $headers, $body, $state);
+        } catch (Throwable) {
+            continue;
+        }
+        $failure = validateResponse($op, $response, $state['components'], $state['checks'], $state['max_response_time'], $caseMode);
+        if ($failure !== null) {
+            $bestBody = (string)$body;
+            $bestResponse = $response;
+            $bestFailure = $failure;
+        }
+    }
+    return [$bestBody, $bestResponse, $bestFailure];
+}
+
+function shrinkCandidates(array $value): array {
+    $candidates = [];
+    if (isAssocArray($value)) {
+        foreach (array_keys($value) as $key) {
+            $candidate = $value;
+            unset($candidate[$key]);
+            $candidates[] = $candidate;
+        }
+        foreach ($value as $key => $item) {
+            $candidate = $value;
+            $candidate[$key] = minimalValue($item);
+            $candidates[] = $candidate;
+        }
+    } else {
+        $candidates[] = [];
+        if ($value) $candidates[] = [minimalValue($value[0])];
+    }
+    return $candidates;
+}
+
+function minimalValue($value) {
+    if (is_string($value)) return '';
+    if (is_int($value) || is_float($value)) return 0;
+    if (is_bool($value)) return false;
+    if (is_array($value)) return isAssocArray($value) ? [] : [];
+    return null;
 }
 
 function runInvalidPathCase(array $op, array &$state, array &$result): void {
     if (!str_contains($op['path'], '{')) return;
     $path = preg_replace('/\{[^}]+\}/', 'not-an-id', $op['path'], 1);
     $url = $state['base_url'] . $path;
-    $request = buildRequestRecord('coverage', $op, $op['method'], $url, $path, $state['headers'], null);
+    $headers = $state['headers'];
+    foreach (operationParameterHeaders($op['operation'], $state['components'], true, 'positive') as $header) $headers[] = $header;
+    foreach (apiKeyCookieHeaders($state['schema'], $state['options']) as $header) $headers[] = $header;
+    $request = buildRequestRecord('coverage', $op, $op['method'], $url, $path, $headers, null);
     try {
-        $response = requestWithState($op['method'], $url, $state['headers'], null, $state);
+        $response = requestWithState($op['method'], $url, $headers, null, $state);
     } catch (Throwable $e) {
         $case = recordCase($state, $request, null, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}");
         recordFailure($state, $result, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}", $case);
@@ -1527,15 +2231,103 @@ function runInvalidPathCase(array $op, array &$state, array &$result): void {
     }
 }
 
+function runMissingRequiredHeaderCases(array $op, array &$state, array &$result): void {
+    if (!in_array('missing_required_header', $state['checks'], true)) return;
+    foreach (operationParameters($op['operation']) as $parameter) {
+        if (($parameter['in'] ?? '') !== 'header' || !($parameter['required'] ?? false)) continue;
+        executeProbeCase(
+            $op,
+            $state,
+            'coverage',
+            requestBodyPayload($op['operation'], $state['components'], 'positive', true),
+            true,
+            'negative',
+            ['skip_headers' => [strtolower((string)$parameter['name'])]],
+            function(array $response) use ($parameter): ?string {
+                return ($response['status'] >= 400 && $response['status'] < 500)
+                    ? null
+                    : "missing required request header '{$parameter['name']}' was accepted with HTTP {$response['status']}";
+            },
+            $result
+        );
+        if (failureLimitReached($state)) return;
+    }
+}
+
+function runIgnoredAuthCases(array $op, array &$state, array &$result): void {
+    if (!in_array('ignored_auth', $state['checks'], true) || !operationRequiresAuth($op['operation'], $state['schema'])) return;
+    $baseHeaders = stripSecurityHeaders($state['headers'], $state['schema']);
+    foreach ([
+        'without credentials' => $baseHeaders,
+        'with invalid credentials' => mergeHeaders($baseHeaders, invalidSecurityHeaders($state['schema']))
+    ] as $label => $headers) {
+        executeProbeCase(
+            $op,
+            $state,
+            'coverage',
+            requestBodyPayload($op['operation'], $state['components'], 'positive', true),
+            true,
+            'negative',
+            ['headers' => $headers],
+            function(array $response) use ($label): ?string {
+                return in_array($response['status'], [401, 403], true)
+                    ? null
+                    : "authenticated operation accepted request {$label}; expected 401 or 403, got HTTP {$response['status']}";
+            },
+            $result
+        );
+        if (failureLimitReached($state)) return;
+    }
+}
+
+function executeProbeCase(array $op, array &$state, string $phase, $payload, bool $useExamples, string $caseMode, array $context, callable $validator, array &$result): ?array {
+    $method = $op['method'];
+    $payload = normalizePayload($payload);
+    $path = concretePath($op['path'], $op['operation'], $useExamples, $state['components'], $context['path_parameters'] ?? []);
+    if (isset($op['operation']['x-graphql-endpoint-path'])) $path = (string)$op['operation']['x-graphql-endpoint-path'];
+    $query = queryString($op['operation'], $state['components'], $useExamples, $caseMode, $context['query_parameters'] ?? [], $state['schema'], $state['options']);
+    $pathQuery = $path . $query;
+    $url = $state['base_url'] . $pathQuery;
+    $headers = $context['headers'] ?? $state['headers'];
+    foreach (operationParameterHeaders($op['operation'], $state['components'], $useExamples, $caseMode, $context['skip_headers'] ?? []) as $header) $headers[] = $header;
+    foreach (apiKeyCookieHeaders($state['schema'], $state['options']) as $header) $headers[] = $header;
+    if ($payload['body'] !== null && $payload['content_type'] !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: ' . $payload['content_type'];
+    $request = buildRequestRecord($phase, $op, $method, $url, $pathQuery, $headers, $payload['body'], $caseMode);
+
+    try {
+        $response = requestWithState($method, $url, $headers, $payload['body'], $state);
+    } catch (Throwable $e) {
+        $case = recordCase($state, $request, null, "{$phase} {$method} {$op['path']} probe failed: {$e->getMessage()}");
+        recordFailure($state, $result, "{$phase} {$method} {$op['path']} probe failed: {$e->getMessage()}", $case);
+        return $case;
+    }
+
+    $state['cases']++;
+    $failure = $validator($response);
+    $case = recordCase($state, $request, $response, $failure);
+    learnFromCase($state, $case);
+    if ($failure) recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}", $case);
+    else $result['passed']++;
+    return $case;
+}
+
+function operationRequiresAuth(array $operation, array $schema): bool {
+    if (array_key_exists('security', $operation)) return is_array($operation['security']) && $operation['security'] !== [];
+    return is_array($schema['security'] ?? null) && $schema['security'] !== [];
+}
+
 function runUnsupportedMethodCase(array $op, array &$state, array &$result): void {
     if (!in_array('unsupported_method', $state['checks'], true)) return;
     $allowed = allowedMethodsForPathItem($op['path_item']);
     if (!$allowed) return;
     $path = concretePath($op['path'], $op['operation'], true);
     $url = $state['base_url'] . $path;
-    $request = buildRequestRecord('coverage', $op, 'TRACE', $url, $path, $state['headers'], null);
+    $headers = $state['headers'];
+    foreach (operationParameterHeaders($op['operation'], $state['components'], true, 'positive') as $header) $headers[] = $header;
+    foreach (apiKeyCookieHeaders($state['schema'], $state['options']) as $header) $headers[] = $header;
+    $request = buildRequestRecord('coverage', $op, 'TRACE', $url, $path, $headers, null);
     try {
-        $response = requestWithState('TRACE', $url, $state['headers'], null, $state);
+        $response = requestWithState('TRACE', $url, $headers, null, $state);
     } catch (Throwable $e) {
         $case = recordCase($state, $request, null, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}");
         recordFailure($state, $result, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}", $case);
@@ -1585,7 +2377,7 @@ function validateResponse(array $op, array $response, array $components, array $
     if ($caseMode === 'negative' && in_array('negative_data_rejection', $checks, true) && ($status < 400 || $status >= 500)) {
         return "negative input was not rejected with a 4xx response; got HTTP {$status}";
     }
-    if ($caseMode === 'positive' && in_array('positive_data_acceptance', $checks, true) && $status >= 400 && $status < 500) {
+    if ($caseMode === 'positive' && in_array('positive_data_acceptance', $checks, true) && $status >= 400 && $status < 500 && !isDocumentedResourceMiss($op, $response)) {
         return "positive input was rejected with HTTP {$status}";
     }
 
@@ -1606,21 +2398,53 @@ function validateResponse(array $op, array $response, array $components, array $
         if ($headerFailure !== null) return $headerFailure;
     }
 
-    $json = $documented['content']['application/json'] ?? null;
-    if (!$json) return null;
-
     $contentType = strtolower($response['headers']['content-type'] ?? '');
-    if (in_array('content_type_conformance', $checks, true) && !str_contains($contentType, 'application/json')) {
+    $documentedMedia = documentedMediaForContentType($documented['content'] ?? [], $contentType);
+    if (in_array('content_type_conformance', $checks, true) && ($documented['content'] ?? []) && $documentedMedia === null) {
         return "undocumented Content-Type '{$contentType}'";
     }
+    if ($documentedMedia === null) return null;
 
-    $decoded = json_decode($response['body'], true);
-    if (!is_array($decoded)) return 'invalid JSON response body';
+    $mediaType = $documentedMedia['media_type'];
+    $media = $documentedMedia['media'];
+    $value = $response['body'];
+    if (isJsonMediaType($mediaType)) {
+        if (trim((string)$response['body']) === '') return 'empty JSON response body';
+        $decoded = json_decode($response['body'], true);
+        if (json_last_error() !== JSON_ERROR_NONE) return 'invalid JSON response body';
+        if (isset($op['operation']['x-graphql-field']) && is_array($decoded) && isset($decoded['errors']) && is_array($decoded['errors']) && $decoded['errors']) {
+            return 'GraphQL response contains errors';
+        }
+        $value = $decoded;
+    }
 
     if (in_array('response_schema_conformance', $checks, true)) {
-        $errors = validateSchema($decoded, $json['schema'] ?? [], $components);
+        $errors = validateSchema($value, $media['schema'] ?? [], $components);
         if ($errors) return 'response schema mismatch: ' . $errors[0];
     }
+    return null;
+}
+
+function isDocumentedResourceMiss(array $op, array $response): bool {
+    if ((int)($response['status'] ?? 0) !== 404) return false;
+    foreach (operationParameters($op['operation']) as $parameter) {
+        if (($parameter['in'] ?? '') === 'path') {
+            return documentedResponseForStatus($op['operation']['responses'] ?? [], 404) !== null;
+        }
+    }
+    return false;
+}
+
+function documentedMediaForContentType(array $content, string $actualContentType): ?array {
+    if (!$content) return null;
+    $actual = strtolower(trim(explode(';', $actualContentType)[0] ?? $actualContentType));
+    foreach ($content as $mediaType => $media) {
+        $candidate = strtolower((string)$mediaType);
+        if ($actual === $candidate || ($actual !== '' && str_ends_with($actual, '+json') && str_ends_with($candidate, '+json'))) {
+            return ['media_type' => (string)$mediaType, 'media' => is_array($media) ? $media : []];
+        }
+    }
+    if ($actual === '' && isset($content['application/json'])) return ['media_type' => 'application/json', 'media' => $content['application/json']];
     return null;
 }
 
@@ -1720,6 +2544,8 @@ function buildRequestRecord(string $phase, array $op, string $method, string $ur
 
 function recordCase(array &$state, array $request, ?array $response, ?string $failure): array {
     $id = caseId($request, $response, $failure, count($state['case_records'] ?? []));
+    $sanitize = (bool)($state['output_sanitize'] ?? true);
+    $truncate = (bool)($state['output_truncate'] ?? true);
     $case = [
         'id' => $id,
         'time' => gmdate('c'),
@@ -1728,8 +2554,8 @@ function recordCase(array &$state, array $request, ?array $response, ?string $fa
         'checks' => $state['checks'] ?? [],
         'max_response_time' => $state['max_response_time'] ?? null,
         'components' => $state['components'] ?? [],
-        'request' => $request,
-        'response' => normalizeResponseForRecord($response),
+        'request' => normalizeRequestForRecord($request, $sanitize, $truncate),
+        'response' => normalizeResponseForRecord($response, $sanitize, $truncate),
         'failure' => $failure
     ];
     $state['case_records'][] = $case;
@@ -1749,14 +2575,118 @@ function caseId(array $request, ?array $response, ?string $failure, int $index):
     ])), 0, 12);
 }
 
-function normalizeResponseForRecord(?array $response): ?array {
+function normalizeRequestForRecord(array $request, bool $sanitize, bool $truncate): array {
+    $request['headers'] = normalizeHeadersForRecord($request['headers'] ?? [], $sanitize);
+    if (isset($request['body']) && is_string($request['body'])) $request['body'] = normalizeBodyForRecord($request['body'], $sanitize, $truncate);
+    return $request;
+}
+
+function normalizeResponseForRecord(?array $response, bool $sanitize = true, bool $truncate = true): ?array {
     if ($response === null) return null;
     return [
         'status' => $response['status'] ?? 0,
-        'headers' => $response['headers'] ?? [],
-        'body' => $response['body'] ?? '',
+        'headers' => normalizeAssocHeadersForRecord($response['headers'] ?? [], $sanitize),
+        'body' => normalizeBodyForRecord((string)($response['body'] ?? ''), $sanitize, $truncate),
         'duration' => $response['duration'] ?? 0.0
     ];
+}
+
+function normalizeHeadersForRecord(array $headers, bool $sanitize): array {
+    if (!$sanitize) return $headers;
+    return array_map(function($header) {
+        if (!str_contains((string)$header, ':')) return $header;
+        [$name, $value] = explode(':', (string)$header, 2);
+        return isSensitiveHeader($name) ? trim($name) . ': [redacted]' : trim($name) . ':' . $value;
+    }, $headers);
+}
+
+function normalizeAssocHeadersForRecord(array $headers, bool $sanitize): array {
+    if (!$sanitize) return $headers;
+    foreach ($headers as $name => $value) {
+        if (isSensitiveHeader((string)$name)) $headers[$name] = '[redacted]';
+    }
+    return $headers;
+}
+
+function normalizeBodyForRecord(string $body, bool $sanitize, bool $truncate): string {
+    if ($sanitize) {
+        $body = preg_replace('/("?(?:password|token|secret|api[_-]?key|authorization)"?\s*[:=]\s*)("[^"]+"|[^,\s}]+)/i', '$1"[redacted]"', $body) ?? $body;
+    }
+    if ($truncate && strlen($body) > 12000) return substr($body, 0, 12000) . "\n[truncated]";
+    return $body;
+}
+
+function isSensitiveHeader(string $name): bool {
+    return in_array(strtolower(trim($name)), ['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'cookie', 'set-cookie'], true);
+}
+
+function learnFromCase(array &$state, array $case): void {
+    $response = $case['response'] ?? null;
+    if (!is_array($response) || !isSuccessfulResponse($response)) return;
+    if (isset($response['headers']['location'])) {
+        $state['resource_values']['location'][] = (string)$response['headers']['location'];
+        $segments = array_values(array_filter(explode('/', parse_url((string)$response['headers']['location'], PHP_URL_PATH) ?: '')));
+        if ($segments) $state['resource_values']['id'][] = end($segments);
+    }
+    $body = json_decode((string)($response['body'] ?? ''), true);
+    if (is_array($body)) learnResourceValuesFromValue($state, $body);
+}
+
+function learnResourceValuesFromValue(array &$state, $value, string $prefix = ''): void {
+    if (!is_array($value)) return;
+    foreach ($value as $key => $item) {
+        $name = strtolower((string)$key);
+        if (is_scalar($item) && ($name === 'id' || str_ends_with($name, 'id') || str_ends_with($name, '_id'))) {
+            foreach (parameterResourceNames((string)$key) as $resourceName) {
+                $state['resource_values'][$resourceName][] = (string)$item;
+            }
+        } elseif (is_array($item)) {
+            learnResourceValuesFromValue($state, $item, $prefix . '.' . $name);
+        }
+    }
+}
+
+function discoverStatefulLinks(array $schema): array {
+    $links = [];
+    foreach (($schema['paths'] ?? []) as $pathItem) {
+        if (!is_array($pathItem)) continue;
+        foreach (HTTP_OPERATION_METHODS as $method) {
+            $operation = $pathItem[$method] ?? null;
+            if (!is_array($operation)) continue;
+            $sourceOperationId = $operation['operationId'] ?? null;
+            if ($sourceOperationId === null) continue;
+            foreach (($operation['responses'] ?? []) as $response) {
+                if (!is_array($response)) continue;
+                foreach (($response['links'] ?? []) as $link) {
+                    if (is_array($link) && isset($link['operationId'])) $links[$sourceOperationId][] = $link;
+                }
+            }
+        }
+    }
+    return $links;
+}
+
+function extractLinkValue($expression, array $case) {
+    if (!is_string($expression)) return $expression;
+    if (str_starts_with($expression, '$response.body#')) {
+        $body = json_decode((string)($case['response']['body'] ?? ''), true);
+        if (!is_array($body)) return null;
+        return jsonPointer($body, substr($expression, strlen('$response.body#')));
+    }
+    if (str_starts_with($expression, '$response.header.')) {
+        $rest = substr($expression, strlen('$response.header.'));
+        $regex = null;
+        if (str_contains($rest, '#regex:')) {
+            [$headerName, $regex] = explode('#regex:', $rest, 2);
+        } else {
+            $headerName = $rest;
+        }
+        $value = $case['response']['headers'][strtolower($headerName)] ?? null;
+        if ($value === null) return null;
+        if ($regex !== null && @preg_match('#' . str_replace('#', '\#', $regex) . '#', (string)$value, $match)) return $match[1] ?? $match[0] ?? null;
+        return $value;
+    }
+    return $expression;
 }
 
 function recordFailure(array &$state, array &$result, string $message, ?array $case = null): void {
@@ -1789,42 +2719,52 @@ function failureLimitReached(array $state): bool {
     return $state['max_failures'] !== null && count($state['failures']) >= $state['max_failures'];
 }
 
-function concretePath(string $path, array $operation, bool $useExamples): string {
-    return preg_replace_callback('/\{([^}]+)\}/', function(array $match) use ($operation, $useExamples) {
+function concretePath(string $path, array $operation, bool $useExamples, array $components = [], array $overrides = []): string {
+    return preg_replace_callback('/\{([^}]+)\}/', function(array $match) use ($operation, $useExamples, $components, $overrides) {
         $name = $match[1];
         foreach (operationParameters($operation) as $parameter) {
             if (($parameter['in'] ?? '') === 'path' && ($parameter['name'] ?? '') === $name) {
-                if ($useExamples && array_key_exists('example', $parameter)) return rawurlencode((string)$parameter['example']);
-                return rawurlencode((string)generateValue($parameter['schema'] ?? ['type' => 'integer'], []));
+                $value = $overrides[$name] ?? null;
+                if ($value === null && $useExamples && array_key_exists('example', $parameter)) $value = $parameter['example'];
+                if ($value === null) $value = generateValue($parameter['schema'] ?? ['type' => 'integer'], $components);
+                return serializePathParameter($value, $parameter);
             }
         }
         return '1';
     }, $path);
 }
 
-function queryString(array $operation, array $components, bool $useExamples, string $caseMode = 'positive'): string {
+function queryString(array $operation, array $components, bool $useExamples, string $caseMode = 'positive', array $overrides = [], array $schema = [], array $options = []): string {
     $query = [];
     foreach (operationParameters($operation) as $parameter) {
         if (($parameter['in'] ?? '') !== 'query') continue;
         $required = (bool)($parameter['required'] ?? false);
         if (!$required && !$useExamples && mt_rand(0, 1) === 0) continue;
-        if ($useExamples && array_key_exists('example', $parameter)) {
-            $query[$parameter['name']] = $parameter['example'];
+        if (array_key_exists((string)$parameter['name'], $overrides)) {
+            $value = $overrides[(string)$parameter['name']];
+        } elseif ($useExamples && array_key_exists('example', $parameter)) {
+            $value = $parameter['example'];
         } elseif ($required || !$useExamples) {
-            $query[$parameter['name']] = $caseMode === 'negative'
+            $value = $caseMode === 'negative'
                 ? generateInvalidValue($parameter['schema'] ?? ['type' => 'string'], $components)
                 : generateValue($parameter['schema'] ?? ['type' => 'string'], $components);
+        } else {
+            continue;
         }
+        appendSerializedQueryParameter($query, $parameter, $value);
     }
+    appendApiKeyQueryParameters($query, $schema, $options);
     return $query ? '?' . http_build_query($query) : '';
 }
 
-function operationParameterHeaders(array $operation, array $components, bool $useExamples, string $caseMode): array {
+function operationParameterHeaders(array $operation, array $components, bool $useExamples, string $caseMode, array $skipHeaders = []): array {
     $headers = [];
     $cookies = [];
+    $skipHeaders = array_map('strtolower', $skipHeaders);
     foreach (operationParameters($operation) as $parameter) {
         $location = $parameter['in'] ?? '';
         if ($location !== 'header' && $location !== 'cookie') continue;
+        if ($location === 'header' && in_array(strtolower((string)$parameter['name']), $skipHeaders, true)) continue;
         $required = (bool)($parameter['required'] ?? false);
         if (!$required && !$useExamples && mt_rand(0, 1) === 0) continue;
         $value = parameterValue($parameter, $components, $useExamples, $caseMode);
@@ -1848,6 +2788,77 @@ function parameterValue(array $parameter, array $components, bool $useExamples, 
     return $caseMode === 'negative' ? generateInvalidValue($schema, $components) : generateValue($schema, $components);
 }
 
+function serializePathParameter($value, array $parameter): string {
+    $style = (string)($parameter['style'] ?? 'simple');
+    $explode = (bool)($parameter['explode'] ?? false);
+    if ($style === 'label') return '.' . rawurlencode(serializeParameterValue($value));
+    if ($style === 'matrix') {
+        $name = (string)($parameter['name'] ?? 'value');
+        if (is_array($value)) {
+            if (isAssocArray($value)) {
+                $items = [];
+                foreach ($value as $key => $item) $items[] = $explode ? "{$key}={$item}" : "{$key},{$item}";
+                return ';' . ($explode ? implode(';', $items) : $name . '=' . implode(',', $items));
+            }
+            return ';' . $name . '=' . implode($explode ? ';' . $name . '=' : ',', array_map('rawurlencode', array_map('strval', $value)));
+        }
+        return ';' . $name . '=' . rawurlencode((string)$value);
+    }
+    return rawurlencode(serializeParameterValue($value));
+}
+
+function appendSerializedQueryParameter(array &$query, array $parameter, $value): void {
+    $name = (string)($parameter['name'] ?? 'param');
+    $style = (string)($parameter['style'] ?? 'form');
+    $explode = array_key_exists('explode', $parameter) ? (bool)$parameter['explode'] : $style === 'form';
+
+    if ($style === 'deepObject' && is_array($value) && isAssocArray($value)) {
+        foreach ($value as $key => $item) $query[$name . '[' . $key . ']'] = scalarParameterValue($item);
+        return;
+    }
+    if (is_array($value)) {
+        if ($explode && $style === 'form' && !isAssocArray($value)) {
+            $query[$name] = array_map('scalarParameterValue', $value);
+            return;
+        }
+        $separator = match ($style) {
+            'spaceDelimited' => ' ',
+            'pipeDelimited' => '|',
+            default => ','
+        };
+        $query[$name] = serializeParameterValueWithSeparator($value, $separator);
+        return;
+    }
+    $query[$name] = scalarParameterValue($value);
+}
+
+function appendApiKeyQueryParameters(array &$query, array $schema, array $options): void {
+    foreach (($schema['components']['securitySchemes'] ?? []) as $schemeName => $scheme) {
+        if (!is_array($scheme) || strtolower((string)($scheme['type'] ?? '')) !== 'apikey' || strtolower((string)($scheme['in'] ?? '')) !== 'query') continue;
+        $value = apiKeyValueForScheme((string)$schemeName, $options);
+        if ($value !== null) $query[(string)($scheme['name'] ?? $schemeName)] = $value;
+    }
+}
+
+function serializeParameterValueWithSeparator(array $value, string $separator): string {
+    if (isAssocArray($value)) {
+        $items = [];
+        foreach ($value as $key => $item) {
+            $items[] = (string)$key;
+            $items[] = scalarParameterValue($item);
+        }
+        return implode($separator, $items);
+    }
+    return implode($separator, array_map('scalarParameterValue', $value));
+}
+
+function scalarParameterValue($value): string {
+    if (is_bool($value)) return $value ? 'true' : 'false';
+    if ($value === null) return 'null';
+    if (is_array($value)) return json_encode($value, JSON_UNESCAPED_SLASHES);
+    return (string)$value;
+}
+
 function serializeParameterValue($value): string {
     if (is_array($value)) {
         if (isAssocArray($value)) return implode(',', array_map(fn($key, $item) => $key . ',' . $item, array_keys($value), $value));
@@ -1867,11 +2878,17 @@ function allowedMethodsForPathItem(array $pathItem): array {
 
 function resolveSchemaRef(array $schema, array $components): array {
     if (!isset($schema['$ref'])) return $schema;
-    $prefix = '#/components/schemas/';
     $ref = (string)$schema['$ref'];
-    if (!str_starts_with($ref, $prefix)) return $schema;
-    $name = substr($ref, strlen($prefix));
-    return $components['schemas'][$name] ?? $schema;
+    foreach ([
+        '#/components/schemas/' => $components['schemas'] ?? [],
+        '#/definitions/' => $components['schemas'] ?? []
+    ] as $prefix => $source) {
+        if (str_starts_with($ref, $prefix)) {
+            $name = substr($ref, strlen($prefix));
+            return is_array($source[$name] ?? null) ? $source[$name] : $schema;
+        }
+    }
+    return $schema;
 }
 
 function generateValue(array $schema, array $components) {
@@ -1889,7 +2906,7 @@ function generateValue(array $schema, array $components) {
         'object' => generateObject($schema, $components),
         'array' => generateArrayValue($schema, $components),
         'integer' => generateInteger($schema),
-        'number' => generateInteger($schema) + (mt_rand(0, 99) / 100),
+        'number' => generateNumber($schema),
         'boolean' => (bool)mt_rand(0, 1),
         default => generateString($schema)
     };
@@ -1951,21 +2968,45 @@ function generateObject(array $schema, array $components): array {
 }
 
 function generateArrayValue(array $schema, array $components): array {
-    $count = mt_rand(0, 2);
+    $min = max(0, (int)($schema['minItems'] ?? 0));
+    $max = max($min, min(5, (int)($schema['maxItems'] ?? max(2, $min + 2))));
+    $count = mt_rand($min, $max);
     $items = [];
     for ($i = 0; $i < $count; $i++) $items[] = generateValue($schema['items'] ?? ['type' => 'string'], $components);
+    if (($schema['uniqueItems'] ?? false) === true) $items = array_values(array_unique($items, SORT_REGULAR));
     return $items;
 }
 
 function generateInteger(array $schema): int {
     $min = isset($schema['minimum']) ? (int)$schema['minimum'] : 0;
+    if (($schema['exclusiveMinimum'] ?? false) === true) $min++;
+    elseif (isset($schema['exclusiveMinimum']) && !is_bool($schema['exclusiveMinimum'])) $min = (int)$schema['exclusiveMinimum'] + 1;
     $max = isset($schema['maximum']) ? (int)$schema['maximum'] : $min + 100;
+    if (($schema['exclusiveMaximum'] ?? false) === true) $max--;
+    elseif (isset($schema['exclusiveMaximum']) && !is_bool($schema['exclusiveMaximum'])) $max = (int)$schema['exclusiveMaximum'] - 1;
     if ($max < $min) $max = $min;
-    return mt_rand($min, $max);
+    $value = mt_rand($min, $max);
+    if (isset($schema['multipleOf']) && (int)$schema['multipleOf'] > 0) {
+        $multiple = (int)$schema['multipleOf'];
+        $value = max($min, (int)(ceil($value / $multiple) * $multiple));
+        if ($value > $max) $value = max($min, (int)(floor($max / $multiple) * $multiple));
+    }
+    return $value;
+}
+
+function generateNumber(array $schema): float {
+    $value = generateInteger($schema) + (mt_rand(0, 99) / 100);
+    if (isset($schema['multipleOf']) && (float)$schema['multipleOf'] > 0.0) {
+        $multiple = (float)$schema['multipleOf'];
+        $value = round($value / $multiple) * $multiple;
+    }
+    return $value;
 }
 
 function generateString(array $schema): string {
     if (($schema['format'] ?? '') === 'uri') return 'https://example.com/' . mt_rand(1, 100000);
+    if (($schema['format'] ?? '') === 'email') return 'user' . mt_rand(1, 100000) . '@example.com';
+    if (($schema['format'] ?? '') === 'uuid') return sprintf('%08x-%04x-4%03x-%04x-%012x', mt_rand(), mt_rand(0, 0xffff), mt_rand(0, 0xfff), mt_rand(0x8000, 0xbfff), mt_rand());
     $max = min(32, max(1, (int)($schema['maxLength'] ?? 12)));
     $min = min($max, max(1, (int)($schema['minLength'] ?? 1)));
     $length = mt_rand($min, $max);
@@ -1982,6 +3023,7 @@ function isAssocArray($value): bool {
 function validateSchema($value, array $schema, array $components, string $path = '$'): array {
     $schema = resolveSchemaRef($schema, $components);
     if (($schema['nullable'] ?? false) && $value === null) return [];
+    if (isset($schema['const']) && $value !== $schema['const']) return ["{$path} does not equal const"];
     if (isset($schema['allOf']) && is_array($schema['allOf'])) {
         foreach ($schema['allOf'] as $part) {
             $errors = validateSchema($value, $part, $components, $path);
@@ -1989,11 +3031,21 @@ function validateSchema($value, array $schema, array $components, string $path =
         }
         return [];
     }
-    if (isset($schema['oneOf']) && is_array($schema['oneOf'])) {
-        foreach ($schema['oneOf'] as $part) {
+    if (isset($schema['anyOf']) && is_array($schema['anyOf'])) {
+        foreach ($schema['anyOf'] as $part) {
             if (!validateSchema($value, $part, $components, $path)) return [];
         }
-        return ["{$path} did not match any oneOf schema"];
+        return ["{$path} did not match any anyOf schema"];
+    }
+    if (isset($schema['oneOf']) && is_array($schema['oneOf'])) {
+        $matches = 0;
+        foreach ($schema['oneOf'] as $part) {
+            if (!validateSchema($value, $part, $components, $path)) $matches++;
+        }
+        return $matches === 1 ? [] : ["{$path} matched {$matches} oneOf schemas"];
+    }
+    if (isset($schema['not']) && is_array($schema['not']) && !validateSchema($value, $schema['not'], $components, $path)) {
+        return ["{$path} matched forbidden not schema"];
     }
     if (array_key_exists('enum', $schema) && !in_array($value, $schema['enum'], true)) return ["{$path} is not in enum"];
 
@@ -2011,16 +3063,52 @@ function validateSchema($value, array $schema, array $components, string $path =
     return match ($type) {
         'object' => validateObjectSchema($value, $schema, $components, $path),
         'array' => validateArraySchema($value, $schema, $components, $path),
-        'integer' => is_int($value) ? [] : ["{$path} is not an integer"],
-        'number' => (is_int($value) || is_float($value)) ? [] : ["{$path} is not a number"],
-        'string' => is_string($value) ? [] : ["{$path} is not a string"],
+        'integer' => validateNumberSchema($value, $schema, $path, true),
+        'number' => validateNumberSchema($value, $schema, $path, false),
+        'string' => validateStringSchema($value, $schema, $path),
         'boolean' => is_bool($value) ? [] : ["{$path} is not a boolean"],
         default => []
     };
 }
 
+function validateNumberSchema($value, array $schema, string $path, bool $integer): array {
+    if ($integer && !is_int($value)) return ["{$path} is not an integer"];
+    if (!$integer && !(is_int($value) || is_float($value))) return ["{$path} is not a number"];
+    if (isset($schema['minimum']) && $value < $schema['minimum']) return ["{$path} is less than minimum {$schema['minimum']}"];
+    if (isset($schema['exclusiveMinimum'])) {
+        $exclusive = is_bool($schema['exclusiveMinimum']) ? ($schema['exclusiveMinimum'] ? ($schema['minimum'] ?? null) : null) : $schema['exclusiveMinimum'];
+        if ($exclusive !== null && $value <= $exclusive) return ["{$path} is not greater than exclusiveMinimum {$exclusive}"];
+    }
+    if (isset($schema['maximum']) && $value > $schema['maximum']) return ["{$path} is greater than maximum {$schema['maximum']}"];
+    if (isset($schema['exclusiveMaximum'])) {
+        $exclusive = is_bool($schema['exclusiveMaximum']) ? ($schema['exclusiveMaximum'] ? ($schema['maximum'] ?? null) : null) : $schema['exclusiveMaximum'];
+        if ($exclusive !== null && $value >= $exclusive) return ["{$path} is not less than exclusiveMaximum {$exclusive}"];
+    }
+    if (isset($schema['multipleOf']) && (float)$schema['multipleOf'] > 0.0) {
+        $ratio = $value / (float)$schema['multipleOf'];
+        if (abs($ratio - round($ratio)) > 0.0000001) return ["{$path} is not a multiple of {$schema['multipleOf']}"];
+    }
+    return [];
+}
+
+function validateStringSchema($value, array $schema, string $path): array {
+    if (!is_string($value)) return ["{$path} is not a string"];
+    $length = strlen($value);
+    if (isset($schema['minLength']) && $length < (int)$schema['minLength']) return ["{$path} is shorter than minLength {$schema['minLength']}"];
+    if (isset($schema['maxLength']) && $length > (int)$schema['maxLength']) return ["{$path} is longer than maxLength {$schema['maxLength']}"];
+    if (isset($schema['pattern']) && @preg_match('/' . str_replace('/', '\/', (string)$schema['pattern']) . '/', '') !== false) {
+        if (!preg_match('/' . str_replace('/', '\/', (string)$schema['pattern']) . '/', $value)) return ["{$path} does not match pattern"];
+    }
+    if (($schema['format'] ?? null) === 'email' && filter_var($value, FILTER_VALIDATE_EMAIL) === false) return ["{$path} is not a valid email"];
+    if (in_array(($schema['format'] ?? null), ['uri', 'url'], true) && filter_var($value, FILTER_VALIDATE_URL) === false) return ["{$path} is not a valid URI"];
+    if (($schema['format'] ?? null) === 'uuid' && !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $value)) return ["{$path} is not a valid UUID"];
+    return [];
+}
+
 function validateObjectSchema($value, array $schema, array $components, string $path): array {
     if (!isAssocArray($value)) return ["{$path} is not an object"];
+    if (isset($schema['minProperties']) && count($value) < (int)$schema['minProperties']) return ["{$path} has fewer properties than minProperties {$schema['minProperties']}"];
+    if (isset($schema['maxProperties']) && count($value) > (int)$schema['maxProperties']) return ["{$path} has more properties than maxProperties {$schema['maxProperties']}"];
     foreach (($schema['required'] ?? []) as $required) {
         if (!array_key_exists($required, $value)) return ["{$path}.{$required} is required"];
     }
@@ -2035,12 +3123,24 @@ function validateObjectSchema($value, array $schema, array $components, string $
         foreach (array_keys($value) as $name) {
             if (!in_array($name, $known, true)) return ["{$path}.{$name} is not documented"];
         }
+    } elseif (is_array($schema['additionalProperties'] ?? null)) {
+        $known = array_keys($schema['properties'] ?? []);
+        foreach ($value as $name => $item) {
+            if (in_array($name, $known, true)) continue;
+            $errors = validateSchema($item, $schema['additionalProperties'], $components, "{$path}.{$name}");
+            if ($errors) return $errors;
+        }
     }
     return [];
 }
 
 function validateArraySchema($value, array $schema, array $components, string $path): array {
     if (!is_array($value) || isAssocArray($value)) return ["{$path} is not an array"];
+    if (isset($schema['minItems']) && count($value) < (int)$schema['minItems']) return ["{$path} has fewer items than minItems {$schema['minItems']}"];
+    if (isset($schema['maxItems']) && count($value) > (int)$schema['maxItems']) return ["{$path} has more items than maxItems {$schema['maxItems']}"];
+    if (($schema['uniqueItems'] ?? false) === true && count(array_unique(array_map(fn($item) => json_encode($item), $value))) !== count($value)) {
+        return ["{$path} items are not unique"];
+    }
     foreach ($value as $index => $item) {
         $errors = validateSchema($item, $schema['items'] ?? [], $components, "{$path}[{$index}]");
         if ($errors) return $errors;

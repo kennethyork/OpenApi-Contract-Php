@@ -65,6 +65,8 @@ const DEFAULT_CACHE_DIR = '.openapi-contract/cache';
 const DEFAULT_REPORT_DIR = 'openapi-contract-report';
 const JSON_MEDIA_TYPES = ['application/json', 'application/problem+json', 'application/vnd.api+json'];
 const PRO_EXTENSION_PATHS = ['openapi-contract-pro.php', 'pro/openapi-contract-pro.php', '.openapi-contract/pro.php'];
+const PRO_LICENSE_ENV = 'OPENAPI_CONTRACT_PRO_TOKEN';
+const PRO_LICENSE_PATHS = ['.openapi-contract/license.key', 'license.key'];
 
 main($argv);
 
@@ -75,6 +77,7 @@ function main(array $argv): void {
     }
 
     $parsed = parseCli($argv);
+    $parsed['options'] = withResolvedProLicense($parsed['options']);
     $command = $parsed['command'] ?? null;
     $proExtension = loadProExtension($parsed['options']);
 
@@ -265,7 +268,37 @@ function printUsage(): void {
     echo "  --no-color                     Accepted for CLI compatibility\n";
 }
 
+function withResolvedProLicense(array $options): array {
+    $token = proLicenseToken($options);
+    if ($token !== '') $options['license-key'] = $token;
+    return $options;
+}
+
+function proLicenseToken(array $options): string {
+    $optionToken = optionString($options, 'license-key', '');
+    if ($optionToken !== '') return $optionToken;
+
+    $envToken = getenv(PRO_LICENSE_ENV);
+    if (is_string($envToken) && trim($envToken) !== '') return trim($envToken);
+
+    foreach (PRO_LICENSE_PATHS as $path) {
+        if (!is_file($path)) continue;
+        $fileToken = trim((string)file_get_contents($path));
+        if ($fileToken !== '') return $fileToken;
+    }
+
+    return '';
+}
+
+function proExtensionInstalled(array $options): bool {
+    foreach (proExtensionPaths($options) as $path) {
+        if (is_file($path)) return true;
+    }
+    return false;
+}
+
 function loadProExtension(array $options): ?callable {
+    if (proLicenseToken($options) === '') return null;
     foreach (proExtensionPaths($options) as $path) {
         if (!is_file($path)) continue;
         require_once $path;
@@ -292,7 +325,17 @@ function runProCommand(?string $action, array $options, ?callable $extension): i
 
     echo "openapi-contract-php Pro\n";
     echo str_repeat("-", 24) . "\n\n";
-    echo "No Pro extension is installed.\n\n";
+    if (proExtensionInstalled($options) && proLicenseToken($options) === '') {
+        echo "Pro extension is installed, but no license token was provided.\n";
+        echo "Community features are active. Pro features are locked.\n\n";
+        echo "Unlock Pro with:\n";
+        echo "  php bin/openapi-contract pro status --license-key YOUR_TOKEN\n";
+        echo "  " . PRO_LICENSE_ENV . "=YOUR_TOKEN php bin/openapi-contract pro status\n";
+        echo "  mkdir -p .openapi-contract && printf '%s' YOUR_TOKEN > .openapi-contract/license.key\n";
+        return 3;
+    }
+
+    echo "No unlocked Pro extension is installed.\n\n";
     echo "Private Pro code can be loaded from one of these ignored paths:\n";
     foreach (PRO_EXTENSION_PATHS as $path) echo "  - {$path}\n";
     echo "\nOr pass an explicit extension file:\n";

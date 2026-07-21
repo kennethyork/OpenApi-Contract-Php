@@ -20,7 +20,7 @@ hosted services, or CI/CD coupling.
 | CLI `init` command | Supported | Creates JSON config interactively or with `--no-interaction`. |
 | CLI `doctor` command | Supported | Checks PHP extensions, config, schema loading, base URL, operations, reports, and compatibility notes. |
 | CLI `benchmark` command | Supported | Runs JSON benchmark suites, writes JSON/Markdown evidence, and compares prior baselines. |
-| CLI `pro` command | Supported | Detects private Pro extensions; run and benchmark commands expose paid extension hooks. |
+| CLI `pro` command | Supported | Detects private Pro extensions; run and benchmark hooks unlock only when a license token is present. |
 | Generated benchmark corpus | Supported | Deterministic working and intentionally broken OpenAPI specs cover the main local runtime checks. |
 | CLI `run` command | Supported | Runs the PHP implementation; can use LOCATION or config `schema-location`. |
 | CLI `fuzz` command | Supported | Runs fuzzing phase directly; supports `--max-time`, modes, seed, and max examples. |

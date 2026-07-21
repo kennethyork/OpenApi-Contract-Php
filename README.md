@@ -31,8 +31,9 @@ The distinct angle is:
 Commercial add-ons can be shipped as a private Pro extension while this
 repository stays useful as the MIT-licensed Community edition. See
 [docs/PRO_EDITION.md](docs/PRO_EDITION.md). Free and paid users run the same
-CLI; a private extension and license token unlock paid reports, rule packs,
-baselines, packaging, and support.
+CLI; without a license token the CLI stays Community-only, and with a token a
+private extension can unlock paid reports, rule packs, baselines, packaging, and
+support.
 
 ## Usage
 
@@ -90,6 +91,9 @@ Paid users keep the same commands and pass a license token:
 php bin/openapi-contract run ./openapi.json --url http://127.0.0.1:8080 \
   --report html --license-key YOUR_TOKEN
 ```
+
+The token can also come from `OPENAPI_CONTRACT_PRO_TOKEN` or
+`.openapi-contract/license.key`.
 
 ```bash
 php bin/openapi-contract run https://api.example.com/openapi.json --phases examples,coverage,fuzzing --max-examples 5

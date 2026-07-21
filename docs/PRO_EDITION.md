@@ -16,10 +16,11 @@ php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
 php bin/openapi-contract replay --cache-dir .openapi-contract/cache
 ```
 
-The difference is whether a private Pro extension and valid license token are
-available. Without Pro, the commands run the Community feature set. With Pro,
-the same commands can add paid reports, paid checks, paid exports, and paid
-workflow integrations.
+The difference is whether a private Pro extension and license token are
+available. Without a license token, the CLI only runs the Community feature set,
+even if a Pro extension file is present. With a token, the CLI loads the private
+extension, and that extension can validate the token before adding paid reports,
+paid checks, paid exports, and paid workflow integrations.
 
 ## Product Boundary
 
@@ -101,8 +102,36 @@ function openapi_contract_pro_after_benchmark(array $report, array $options): vo
 }
 ```
 
-License keys should be passed through environment variables, an ignored local
-file, or `--license-key`. Do not commit license keys to the public repository.
+## License Unlock
+
+No license token means Community-only behavior. The public CLI will not load the
+private Pro extension unless it can find a token.
+
+Token sources, in order:
+
+1. `--license-key`
+2. `OPENAPI_CONTRACT_PRO_TOKEN`
+3. `.openapi-contract/license.key`
+4. `license.key`
+
+Examples:
+
+```bash
+php bin/openapi-contract pro status --license-key YOUR_TOKEN
+```
+
+```bash
+OPENAPI_CONTRACT_PRO_TOKEN=YOUR_TOKEN php bin/openapi-contract run openapi.json \
+  --url http://127.0.0.1:8080
+```
+
+```bash
+mkdir -p .openapi-contract
+printf '%s' YOUR_TOKEN > .openapi-contract/license.key
+php bin/openapi-contract benchmark tests/benchmarks/throw-the-book.json
+```
+
+Do not commit license keys to the public repository.
 
 ## Pricing Starting Point
 

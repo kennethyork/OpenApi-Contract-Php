@@ -12,6 +12,8 @@
   "paths": {
     "/health": {
       "get": {
+        "operationId": "getHealth",
+        "tags": ["health"],
         "responses": {
           "200": {
             "description": "Health response",

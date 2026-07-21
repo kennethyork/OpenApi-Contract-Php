@@ -61,12 +61,18 @@ function printUsage(): void {
     echo "  --schemathesis-bin PATH        Use a specific schemathesis/st executable\n\n";
     echo "Shared options are passed to both commands. Useful shared options:\n";
     echo "  -u, --url URL\n";
+    echo "  -w, --workers N|auto\n";
     echo "  -H, --header NAME:VALUE\n";
+    echo "  -a, --auth USER:PASS\n";
     echo "  --phases examples,coverage,fuzzing\n";
     echo "  --checks LIST\n";
     echo "  --exclude-checks LIST\n";
+    echo "  --max-response-time SECONDS\n";
+    echo "  --include-TYPE VALUE / --exclude-TYPE VALUE\n";
+    echo "  --include-TYPE-regex PATTERN / --exclude-TYPE-regex PATTERN\n";
     echo "  -n, --max-examples N\n";
     echo "  --max-failures N\n";
+    echo "  --request-timeout SECONDS\n";
     echo "  --seed N\n";
     echo "  --no-color\n";
 }
@@ -123,11 +129,59 @@ function optionConsumesValue(string $option): bool {
         '--max-examples',
         '-a',
         '--auth',
-        '--phases',
+        '-c',
         '--checks',
+        '-m',
+        '--mode',
+        '-w',
+        '--workers',
+        '--phases',
+        '--suppress-health-check',
+        '--wait-for-schema',
+        '--warnings',
         '--exclude-checks',
         '--max-failures',
+        '--max-response-time',
+        '--include-path',
+        '--include-method',
+        '--include-tag',
+        '--include-operation-id',
+        '--exclude-path',
+        '--exclude-method',
+        '--exclude-tag',
+        '--exclude-operation-id',
+        '--include-path-regex',
+        '--include-method-regex',
+        '--include-tag-regex',
+        '--include-operation-id-regex',
+        '--exclude-path-regex',
+        '--exclude-method-regex',
+        '--exclude-tag-regex',
+        '--exclude-operation-id-regex',
+        '--include-by',
+        '--exclude-by',
         '--request-timeout',
+        '--request-retries',
+        '--request-cert',
+        '--request-cert-key',
+        '--proxy',
+        '--tls-verify',
+        '--rate-limit',
+        '--max-redirects',
+        '--report',
+        '--report-dir',
+        '--report-junit-path',
+        '--report-vcr-path',
+        '--report-har-path',
+        '--report-ndjson-path',
+        '--output-sanitize',
+        '--output-truncate',
+        '--generation-allow-x00',
+        '--generation-codec',
+        '--generation-maximize',
+        '--generation-with-security-parameters',
+        '--generation-graphql-allow-null',
+        '--generation-database',
         '--seed'
     ], true);
 }

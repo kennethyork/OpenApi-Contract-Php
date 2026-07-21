@@ -31,6 +31,22 @@ const DEFAULT_CHECKS = [
     'unsupported_method'
 ];
 
+const KNOWN_CHECKS = [
+    'not_a_server_error',
+    'status_code_conformance',
+    'content_type_conformance',
+    'response_headers_conformance',
+    'response_schema_conformance',
+    'negative_data_rejection',
+    'positive_data_acceptance',
+    'use_after_free',
+    'ensure_resource_availability',
+    'ignored_auth',
+    'missing_required_header',
+    'unsupported_method'
+];
+
+const IMPLEMENTED_CHECKS = DEFAULT_CHECKS;
 const HTTP_OPERATION_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 
 main($argv);
@@ -42,38 +58,45 @@ function main(array $argv): void {
     }
 
     $parsed = parseCli($argv);
-    if (($parsed['command'] ?? '') !== 'run' || empty($parsed['location'])) {
+    $command = $parsed['command'] ?? null;
+    if (!in_array($command, ['run', 'fuzz'], true) || empty($parsed['location'])) {
         printUsage();
         exit(2);
     }
 
     $options = $parsed['options'];
     $location = $parsed['location'];
-    $phases = csvOption($options, 'phases', ['examples', 'coverage', 'fuzzing']);
-    $maxExamples = max(1, (int)($options['max-examples'] ?? 5));
+    $phases = $command === 'fuzz' ? ['fuzzing'] : csvOption($options, 'phases', ['examples', 'coverage', 'fuzzing']);
+    $maxTime = isset($options['max-time']) ? max(1.0, (float)$options['max-time']) : null;
+    $maxExamplesDefault = $command === 'fuzz' ? ($maxTime === null ? 100 : PHP_INT_MAX) : 5;
+    $maxExamples = max(1, (int)($options['max-examples'] ?? $maxExamplesDefault));
     $maxFailures = isset($options['max-failures']) ? max(1, (int)$options['max-failures']) : null;
     $timeout = isset($options['request-timeout']) ? max(1.0, (float)$options['request-timeout']) : 10.0;
     $headers = headersFromOptions($options);
     $checks = selectedChecks($options);
     $seed = isset($options['seed']) ? (int)$options['seed'] : random_int(1, PHP_INT_MAX);
+    $transport = transportOptionsFromOptions($options);
     mt_srand($seed);
 
     echo "openapi-contract-php v0.1\n";
     echo str_repeat("-", 20) . "\n\n";
 
     try {
-        $schema = loadSchema($location, $timeout);
+        $schema = loadSchema($location, $timeout, isset($options['wait-for-schema']) ? (float)$options['wait-for-schema'] : 0.0, $transport);
         $baseUrl = baseUrlFromSchema($schema, $options['url'] ?? null);
     } catch (Throwable $e) {
         echo " FAIL Could not load specification: {$e->getMessage()}\n";
         exit(1);
     }
 
-    $operations = collectOperations($schema);
+    $warnings = [];
+    addCompatibilityWarnings($options, $phases, $checks, $command, $schema, $warnings);
+    $allOperations = collectOperations($schema);
+    $operations = filterOperations($allOperations, $options, $warnings);
     echo " OK   Loaded specification from {$location}\n\n";
     echo "     Base URL:         {$baseUrl}\n";
     echo "     Specification:    OpenAPI " . ($schema['openapi'] ?? 'unknown') . "\n";
-    echo "     Operations:       " . count($operations) . " selected / " . count($operations) . " total\n";
+    echo "     Operations:       " . count($operations) . " selected / " . count($allOperations) . " total\n";
     echo "     Seed:             {$seed}\n\n";
 
     $state = [
@@ -83,21 +106,28 @@ function main(array $argv): void {
         'headers' => $headers,
         'checks' => $checks,
         'timeout' => $timeout,
+        'transport' => $transport,
+        'max_response_time' => isset($options['max-response-time']) ? max(PHP_FLOAT_EPSILON, (float)$options['max-response-time']) : null,
         'max_failures' => $maxFailures,
         'failures' => [],
-        'warnings' => [],
+        'warnings' => $warnings,
         'cases' => 0,
-        'seed' => $seed
+        'total_operations' => count($allOperations),
+        'seed' => $seed,
+        'last_request_at' => null
     ];
 
     $phaseResults = [];
+    $deadline = $maxTime === null ? null : microtime(true) + $maxTime;
     foreach ($phases as $phase) {
         if (failureLimitReached($state)) break;
+        if ($deadline !== null && microtime(true) >= $deadline) break;
         $started = microtime(true);
         $result = match ($phase) {
             'examples' => runExamplesPhase($operations, $state),
             'coverage' => runCoveragePhase($operations, $state),
-            'fuzzing' => runFuzzingPhase($operations, $state, $maxExamples),
+            'fuzzing' => runFuzzingPhase($operations, $state, $maxExamples, $deadline),
+            'stateful' => ['passed' => 0, 'failed' => 0, 'skipped' => count($operations), 'label' => 'Stateful', 'unsupported' => true],
             default => ['passed' => 0, 'failed' => 0, 'skipped' => count($operations), 'label' => ucfirst($phase), 'unsupported' => true]
         };
         $result['duration'] = microtime(true) - $started;
@@ -112,16 +142,31 @@ function main(array $argv): void {
 }
 
 function printUsage(): void {
-    echo "Usage: php bin/openapi-contract run [OPTIONS] LOCATION\n\n";
+    echo "Usage:\n";
+    echo "  php bin/openapi-contract run [OPTIONS] LOCATION\n";
+    echo "  php bin/openapi-contract fuzz [OPTIONS] LOCATION\n\n";
     echo "Options:\n";
     echo "  -u, --url URL                  API base URL for file-based schemas\n";
+    echo "  -w, --workers N|auto           Accepted for Schemathesis CLI compatibility\n";
     echo "  -H, --header NAME:VALUE        Add a custom HTTP header\n";
-    echo "  --phases LIST                  examples,coverage,fuzzing\n";
+    echo "  -a, --auth USER:PASS           Basic authentication\n";
+    echo "  --phases LIST                  examples,coverage,fuzzing,stateful\n";
     echo "  --checks LIST                  Checks to run, or all\n";
     echo "  --exclude-checks LIST          Checks to skip\n";
+    echo "  --max-response-time SECONDS    Fail responses slower than this limit\n";
+    echo "  --include-TYPE VALUE           TYPE: path, method, tag, operation-id\n";
+    echo "  --exclude-TYPE VALUE           TYPE: path, method, tag, operation-id\n";
+    echo "  --include-TYPE-regex PATTERN   Regex include filter\n";
+    echo "  --exclude-TYPE-regex PATTERN   Regex exclude filter\n";
+    echo "  --exclude-deprecated           Skip deprecated operations\n";
     echo "  -n, --max-examples N           Fuzz examples per operation\n";
     echo "  --max-failures N               Stop after N failures\n";
+    echo "  --max-time SECONDS             Stop fuzz command after this duration\n";
     echo "  --request-timeout SECONDS      Per-request timeout\n";
+    echo "  --request-retries N            Retry network failures\n";
+    echo "  --max-redirects N              Follow up to N redirects\n";
+    echo "  --proxy URL                    HTTP proxy URL\n";
+    echo "  --tls-verify true|false|PATH   TLS verification setting\n";
     echo "  --seed N                       Reproducible random seed\n";
     echo "  --no-color                     Accepted for CLI compatibility\n";
 }
@@ -137,6 +182,22 @@ function parseCli(array $argv): array {
             $options['header'][] = $argv[++$i] ?? '';
             continue;
         }
+        if ($arg === '-a' || $arg === '--auth') {
+            $options['auth'] = $argv[++$i] ?? '';
+            continue;
+        }
+        if ($arg === '-c' || $arg === '--checks') {
+            appendOption($options, 'checks', $argv[++$i] ?? '');
+            continue;
+        }
+        if ($arg === '-m' || $arg === '--mode') {
+            $options['mode'] = $argv[++$i] ?? '';
+            continue;
+        }
+        if ($arg === '-w' || $arg === '--workers') {
+            $options['workers'] = $argv[++$i] ?? '';
+            continue;
+        }
         if ($arg === '-u' || $arg === '--url') {
             $options['url'] = $argv[++$i] ?? '';
             continue;
@@ -150,9 +211,12 @@ function parseCli(array $argv): array {
             if (str_contains($arg, '=')) {
                 [$key, $value] = explode('=', $arg, 2);
                 if ($key === 'header') $options['header'][] = $value;
+                elseif (isRepeatableOption($key)) appendOption($options, $key, $value);
                 else $options[$key] = $value;
             } elseif (longOptionRequiresValue($arg)) {
-                $options[$arg] = $argv[++$i] ?? '';
+                $value = $argv[++$i] ?? '';
+                if (isRepeatableOption($arg)) appendOption($options, $arg, $value);
+                else $options[$arg] = $value;
             } elseif ($arg === 'header') {
                 $options['header'][] = $argv[++$i] ?? '';
             } else {
@@ -168,21 +232,112 @@ function parseCli(array $argv): array {
 function longOptionRequiresValue(string $option): bool {
     return in_array($option, [
         'url',
+        'workers',
         'max-examples',
+        'max-time',
         'phases',
+        'suppress-health-check',
+        'wait-for-schema',
+        'warnings',
         'checks',
         'exclude-checks',
         'max-failures',
+        'max-response-time',
+        'include-path',
+        'include-method',
+        'include-tag',
+        'include-operation-id',
+        'exclude-path',
+        'exclude-method',
+        'exclude-tag',
+        'exclude-operation-id',
+        'include-path-regex',
+        'include-method-regex',
+        'include-tag-regex',
+        'include-operation-id-regex',
+        'exclude-path-regex',
+        'exclude-method-regex',
+        'exclude-tag-regex',
+        'exclude-operation-id-regex',
+        'include-by',
+        'exclude-by',
         'request-timeout',
+        'request-retries',
+        'request-cert',
+        'request-cert-key',
+        'proxy',
+        'tls-verify',
+        'rate-limit',
+        'max-redirects',
+        'report',
+        'report-dir',
+        'report-junit-path',
+        'report-vcr-path',
+        'report-har-path',
+        'report-ndjson-path',
+        'output-sanitize',
+        'output-truncate',
+        'mode',
         'seed',
-        'auth'
+        'auth',
+        'generation-allow-x00',
+        'generation-codec',
+        'generation-maximize',
+        'generation-with-security-parameters',
+        'generation-graphql-allow-null',
+        'generation-database',
+        'schema-location'
     ], true);
+}
+
+function isRepeatableOption(string $option): bool {
+    return in_array($option, [
+        'checks',
+        'exclude-checks',
+        'include-path',
+        'include-method',
+        'include-tag',
+        'include-operation-id',
+        'exclude-path',
+        'exclude-method',
+        'exclude-tag',
+        'exclude-operation-id',
+        'include-path-regex',
+        'include-method-regex',
+        'include-tag-regex',
+        'include-operation-id-regex',
+        'exclude-path-regex',
+        'exclude-method-regex',
+        'exclude-tag-regex',
+        'exclude-operation-id-regex',
+        'include-by',
+        'exclude-by',
+        'report'
+    ], true);
+}
+
+function appendOption(array &$options, string $name, string $value): void {
+    if (!isset($options[$name])) {
+        $options[$name] = [$value];
+        return;
+    }
+    if (!is_array($options[$name])) {
+        $options[$name] = [$options[$name]];
+    }
+    $options[$name][] = $value;
 }
 
 function csvOption(array $options, string $name, array $default): array {
     $value = $options[$name] ?? null;
     if ($value === null || $value === true || $value === '') return $default;
-    return array_values(array_filter(array_map('trim', explode(',', (string)$value))));
+    if (is_array($value)) {
+        $items = [];
+        foreach ($value as $item) {
+            $items = array_merge($items, array_map('trim', explode(',', (string)$item)));
+        }
+        return array_values(array_filter($items, fn($item) => $item !== ''));
+    }
+    return array_values(array_filter(array_map('trim', explode(',', (string)$value)), fn($item) => $item !== ''));
 }
 
 function headersFromOptions(array $options): array {
@@ -206,15 +361,106 @@ function hasHeader(array $headers, string $name): bool {
 
 function selectedChecks(array $options): array {
     $checks = csvOption($options, 'checks', DEFAULT_CHECKS);
-    if (in_array('all', $checks, true)) $checks = DEFAULT_CHECKS;
+    if (in_array('all', $checks, true)) $checks = KNOWN_CHECKS;
     $exclude = csvOption($options, 'exclude-checks', []);
     if (in_array('all', $exclude, true)) return [];
     return array_values(array_diff($checks, $exclude));
 }
 
-function loadSchema(string $location, float $timeout): array {
+function transportOptionsFromOptions(array $options): array {
+    return [
+        'request_retries' => isset($options['request-retries']) ? max(0, (int)$options['request-retries']) : 0,
+        'max_redirects' => isset($options['max-redirects']) ? max(0, (int)$options['max-redirects']) : 0,
+        'proxy' => isset($options['proxy']) ? trim((string)$options['proxy']) : null,
+        'tls_verify' => parseTlsVerify($options['tls-verify'] ?? true),
+        'request_cert' => isset($options['request-cert']) ? trim((string)$options['request-cert']) : null,
+        'request_cert_key' => isset($options['request-cert-key']) ? trim((string)$options['request-cert-key']) : null,
+        'rate_limit_interval' => isset($options['rate-limit']) ? parseRateLimit((string)$options['rate-limit']) : null
+    ];
+}
+
+function parseTlsVerify($value) {
+    if ($value === true || $value === null) return true;
+    $normalized = strtolower(trim((string)$value));
+    return match ($normalized) {
+        'false', '0', 'no', 'off' => false,
+        'true', '1', 'yes', 'on' => true,
+        default => (string)$value
+    };
+}
+
+function parseRateLimit(string $value): ?float {
+    if (!preg_match('/^\s*(\d+(?:\.\d+)?)\s*\/\s*([smh])\s*$/i', $value, $match)) return null;
+    $limit = (float)$match[1];
+    if ($limit <= 0.0) return null;
+    $seconds = match (strtolower($match[2])) {
+        'h' => 3600.0,
+        'm' => 60.0,
+        default => 1.0
+    };
+    return $seconds / $limit;
+}
+
+function addCompatibilityWarnings(array $options, array $phases, array $checks, string $command, array $schema, array &$warnings): void {
+    foreach (array_diff($checks, IMPLEMENTED_CHECKS) as $check) {
+        $warnings[] = "Check '{$check}' is accepted for Schemathesis compatibility but is not implemented yet.";
+    }
+    if (in_array('stateful', $phases, true)) {
+        $warnings[] = "Stateful testing is accepted in --phases but skipped until link/workflow execution is implemented.";
+    }
+    if (isset($options['workers']) && (string)$options['workers'] !== '1') {
+        $warnings[] = "--workers is accepted but execution is currently sequential.";
+    }
+    if ($command === 'fuzz' && !isset($options['max-time']) && !isset($options['max-examples'])) {
+        $warnings[] = "fuzz currently runs 100 examples per operation by default; pass --max-time for time-bounded fuzzing.";
+    }
+    if (($options['mode'] ?? 'positive') !== 'positive') {
+        $warnings[] = "--mode is accepted, but only positive data generation is implemented yet.";
+    }
+    if (($options['generation-deterministic'] ?? false) === true) {
+        $warnings[] = "--generation-deterministic is accepted; use --seed for current reproducibility.";
+    }
+    foreach ([
+        'no-shrink' => 'shrinking',
+        'generation-maximize' => 'targeted generation',
+        'generation-database' => 'example database persistence',
+        'generation-unique-inputs' => 'unique-input filtering',
+        'generation-graphql-allow-null' => 'GraphQL generation',
+        'report' => 'report generation',
+        'report-junit-path' => 'JUnit reporting',
+        'report-vcr-path' => 'VCR reporting',
+        'report-har-path' => 'HAR reporting',
+        'report-ndjson-path' => 'NDJSON reporting'
+    ] as $option => $feature) {
+        if (isset($options[$option])) {
+            $warnings[] = "--{$option} is accepted, but {$feature} is not implemented yet.";
+        }
+    }
+    if (!str_starts_with((string)($schema['openapi'] ?? ''), '3.')) {
+        $warnings[] = "Only OpenAPI 3.x JSON is actively supported by this runner today.";
+    }
+}
+
+function loadSchema(string $location, float $timeout, float $waitForSchema = 0.0, array $transport = []): array {
+    $deadline = $waitForSchema > 0.0 ? microtime(true) + $waitForSchema : null;
+    $lastError = null;
+
+    do {
+        try {
+            return loadSchemaOnce($location, $timeout, $transport);
+        } catch (Throwable $e) {
+            $lastError = $e;
+            if ($deadline === null || microtime(true) >= $deadline) break;
+            usleep(250000);
+        }
+    } while (true);
+
+    throw $lastError ?? new RuntimeException('schema could not be loaded');
+}
+
+function loadSchemaOnce(string $location, float $timeout, array $transport = []): array {
     if (preg_match('#^https?://#', $location)) {
-        $response = httpRequest('GET', $location, ['Accept: application/json'], null, $timeout);
+        $response = httpRequest('GET', $location, ['Accept: application/json'], null, $timeout, $transport);
         if ($response['status'] < 200 || $response['status'] >= 300) {
             throw new RuntimeException("schema returned HTTP {$response['status']}");
         }
@@ -228,19 +474,33 @@ function loadSchema(string $location, float $timeout): array {
     return $schema;
 }
 
-function httpRequest(string $method, string $url, array $headers, ?string $body, float $timeout): array {
+function httpRequest(string $method, string $url, array $headers, ?string $body, float $timeout, array $transport = []): array {
     $ch = curl_init($url);
-    curl_setopt_array($ch, [
+    $curlOptions = [
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HEADER => true,
-        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_FOLLOWLOCATION => ((int)($transport['max_redirects'] ?? 0)) > 0,
+        CURLOPT_MAXREDIRS => (int)($transport['max_redirects'] ?? 0),
         CURLOPT_CONNECTTIMEOUT => min(5.0, $timeout),
         CURLOPT_TIMEOUT => $timeout,
         CURLOPT_HTTPHEADER => $headers
-    ]);
+    ];
+    if (!empty($transport['proxy'])) $curlOptions[CURLOPT_PROXY] = (string)$transport['proxy'];
+    $tlsVerify = $transport['tls_verify'] ?? true;
+    if ($tlsVerify === false) {
+        $curlOptions[CURLOPT_SSL_VERIFYPEER] = false;
+        $curlOptions[CURLOPT_SSL_VERIFYHOST] = false;
+    } elseif (is_string($tlsVerify)) {
+        $curlOptions[CURLOPT_CAINFO] = $tlsVerify;
+    }
+    if (!empty($transport['request_cert'])) $curlOptions[CURLOPT_SSLCERT] = (string)$transport['request_cert'];
+    if (!empty($transport['request_cert_key'])) $curlOptions[CURLOPT_SSLKEY] = (string)$transport['request_cert_key'];
+    curl_setopt_array($ch, $curlOptions);
     if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    $started = microtime(true);
     $raw = curl_exec($ch);
+    $duration = microtime(true) - $started;
     if ($raw === false) {
         $error = curl_error($ch);
         curl_close($ch);
@@ -258,7 +518,7 @@ function httpRequest(string $method, string $url, array $headers, ?string $body,
         [$name, $value] = explode(':', $line, 2);
         $parsedHeaders[strtolower(trim($name))] = trim($value);
     }
-    return ['status' => $status, 'headers' => $parsedHeaders, 'body' => $responseBody];
+    return ['status' => $status, 'headers' => $parsedHeaders, 'body' => $responseBody, 'duration' => $duration];
 }
 
 function baseUrlFromSchema(array $schema, ?string $override): string {
@@ -286,6 +546,111 @@ function collectOperations(array $schema): array {
     return $operations;
 }
 
+function filterOperations(array $operations, array $options, array &$warnings): array {
+    $selected = [];
+    foreach ($operations as $operation) {
+        if (operationIncluded($operation, $options, $warnings)) $selected[] = $operation;
+    }
+    return $selected;
+}
+
+function operationIncluded(array $operation, array $options, array &$warnings): bool {
+    if (($options['exclude-deprecated'] ?? false) && ($operation['operation']['deprecated'] ?? false)) return false;
+
+    foreach (['path', 'method', 'tag', 'operation-id'] as $type) {
+        $include = optionValues($options, "include-{$type}");
+        if ($include && !operationMatchesAny($operation, $type, $include, false, $warnings)) return false;
+
+        $includeRegex = optionValues($options, "include-{$type}-regex");
+        if ($includeRegex && !operationMatchesAny($operation, $type, $includeRegex, true, $warnings)) return false;
+
+        $exclude = optionValues($options, "exclude-{$type}");
+        if ($exclude && operationMatchesAny($operation, $type, $exclude, false, $warnings)) return false;
+
+        $excludeRegex = optionValues($options, "exclude-{$type}-regex");
+        if ($excludeRegex && operationMatchesAny($operation, $type, $excludeRegex, true, $warnings)) return false;
+    }
+
+    foreach (optionValues($options, 'include-by') as $expression) {
+        $matches = operationMatchesExpression($operation, $expression, $warnings);
+        if ($matches === false) return false;
+    }
+    foreach (optionValues($options, 'exclude-by') as $expression) {
+        $matches = operationMatchesExpression($operation, $expression, $warnings);
+        if ($matches === true) return false;
+    }
+
+    return true;
+}
+
+function optionValues(array $options, string $name): array {
+    if (!isset($options[$name]) || $options[$name] === true) return [];
+    $value = $options[$name];
+    if (!is_array($value)) $value = [$value];
+    return array_values(array_filter(array_map('strval', $value), fn(string $item) => $item !== ''));
+}
+
+function operationMatchesAny(array $operation, string $type, array $needles, bool $regex, array &$warnings): bool {
+    $values = operationFilterValues($operation, $type);
+    foreach ($needles as $needle) {
+        foreach ($values as $value) {
+            if ($regex) {
+                if (@preg_match('/' . str_replace('/', '\/', $needle) . '/', '') === false) {
+                    $warnings[] = "Ignoring invalid regex filter '{$needle}'.";
+                    continue 2;
+                }
+                if (preg_match('/' . str_replace('/', '\/', $needle) . '/', $value)) return true;
+            } elseif (strcasecmp($value, $needle) === 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function operationFilterValues(array $operation, string $type): array {
+    return match ($type) {
+        'path' => [$operation['path']],
+        'method' => [$operation['method']],
+        'tag' => array_map('strval', $operation['operation']['tags'] ?? []),
+        'operation-id' => isset($operation['operation']['operationId']) ? [(string)$operation['operation']['operationId']] : [],
+        default => []
+    };
+}
+
+function operationMatchesExpression(array $operation, string $expression, array &$warnings): ?bool {
+    if (!preg_match('/^\s*(\/\S*)\s*(==|!=)\s*(.+?)\s*$/', $expression, $match)) {
+        $warnings[] = "Ignoring unsupported filter expression '{$expression}'.";
+        return null;
+    }
+    $document = array_merge($operation['operation'], [
+        'path' => $operation['path'],
+        'method' => $operation['method'],
+        'operation' => $operation['operation']
+    ]);
+    $actual = jsonPointer($document, $match[1]);
+    $expected = trim($match[3]);
+    if ((str_starts_with($expected, "'") && str_ends_with($expected, "'")) || (str_starts_with($expected, '"') && str_ends_with($expected, '"'))) {
+        $expected = substr($expected, 1, -1);
+    }
+    $matches = (string)$actual === $expected;
+    return $match[2] === '!=' ? !$matches : $matches;
+}
+
+function jsonPointer($document, string $pointer) {
+    if ($pointer === '') return $document;
+    $current = $document;
+    foreach (explode('/', ltrim($pointer, '/')) as $segment) {
+        $segment = str_replace(['~1', '~0'], ['/', '~'], $segment);
+        if (is_array($current) && array_key_exists($segment, $current)) {
+            $current = $current[$segment];
+        } else {
+            return null;
+        }
+    }
+    return is_scalar($current) || $current === null ? $current : json_encode($current);
+}
+
 function runExamplesPhase(array $operations, array &$state): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
     foreach ($operations as $operation) {
@@ -306,10 +671,11 @@ function runCoveragePhase(array $operations, array &$state): array {
     return $result;
 }
 
-function runFuzzingPhase(array $operations, array &$state, int $maxExamples): array {
+function runFuzzingPhase(array $operations, array &$state, int $maxExamples, ?float $deadline = null): array {
     $result = ['passed' => 0, 'failed' => 0, 'skipped' => 0];
     foreach ($operations as $operation) {
         for ($i = 0; $i < $maxExamples; $i++) {
+            if ($deadline !== null && microtime(true) >= $deadline) break 2;
             runCase($operation, $state, 'fuzzing', generatedRequestBody($operation['operation'], $state['components']), false, $result);
             if (failureLimitReached($state)) break 2;
         }
@@ -339,14 +705,14 @@ function runCase(array $op, array &$state, string $phase, ?string $body, bool $u
     if ($body !== null && !hasHeader($headers, 'content-type')) $headers[] = 'Content-Type: application/json';
 
     try {
-        $response = httpRequest($method, $url, $headers, $body, $state['timeout']);
+        $response = requestWithState($method, $url, $headers, $body, $state);
     } catch (Throwable $e) {
         recordFailure($state, $result, "{$phase} {$method} {$op['path']} request failed: {$e->getMessage()}");
         return;
     }
 
     $state['cases']++;
-    $failure = validateResponse($op, $response, $state['components'], $state['checks']);
+    $failure = validateResponse($op, $response, $state['components'], $state['checks'], $state['max_response_time']);
     if ($failure) {
         recordFailure($state, $result, "{$phase} {$method} {$op['path']}: {$failure}");
     } else {
@@ -358,7 +724,7 @@ function runInvalidPathCase(array $op, array &$state, array &$result): void {
     if (!str_contains($op['path'], '{')) return;
     $path = preg_replace('/\{[^}]+\}/', 'not-an-id', $op['path'], 1);
     try {
-        $response = httpRequest($op['method'], $state['base_url'] . $path, $state['headers'], null, $state['timeout']);
+        $response = requestWithState($op['method'], $state['base_url'] . $path, $state['headers'], null, $state);
     } catch (Throwable $e) {
         recordFailure($state, $result, "coverage {$op['method']} {$path} request failed: {$e->getMessage()}");
         return;
@@ -377,7 +743,7 @@ function runUnsupportedMethodCase(array $op, array &$state, array &$result): voi
     $allowed = allowedMethodsForPathItem($op['path_item']);
     if (!$allowed) return;
     try {
-        $response = httpRequest('TRACE', $state['base_url'] . concretePath($op['path'], $op['operation'], true), $state['headers'], null, $state['timeout']);
+        $response = requestWithState('TRACE', $state['base_url'] . concretePath($op['path'], $op['operation'], true), $state['headers'], null, $state);
     } catch (Throwable $e) {
         recordFailure($state, $result, "coverage TRACE {$op['path']} request failed: {$e->getMessage()}");
         return;
@@ -392,8 +758,34 @@ function runUnsupportedMethodCase(array $op, array &$state, array &$result): voi
     }
 }
 
-function validateResponse(array $op, array $response, array $components, array $checks): ?string {
+function requestWithState(string $method, string $url, array $headers, ?string $body, array &$state): array {
+    $interval = $state['transport']['rate_limit_interval'] ?? null;
+    if ($interval !== null && $state['last_request_at'] !== null) {
+        $wait = $interval - (microtime(true) - $state['last_request_at']);
+        if ($wait > 0) usleep((int)round($wait * 1000000));
+    }
+
+    $retries = (int)($state['transport']['request_retries'] ?? 0);
+    $attempt = 0;
+    do {
+        try {
+            $response = httpRequest($method, $url, $headers, $body, $state['timeout'], $state['transport']);
+            $state['last_request_at'] = microtime(true);
+            return $response;
+        } catch (Throwable $e) {
+            if ($attempt >= $retries) throw $e;
+            usleep((int)(100000 * (2 ** $attempt)));
+            $attempt++;
+        }
+    } while (true);
+}
+
+function validateResponse(array $op, array $response, array $components, array $checks, ?float $maxResponseTime): ?string {
     $status = $response['status'];
+    if ($maxResponseTime !== null && ($response['duration'] ?? 0.0) > $maxResponseTime) {
+        return sprintf('response time %.6fs exceeded %.6fs', $response['duration'], $maxResponseTime);
+    }
+
     if (in_array('not_a_server_error', $checks, true) && $status >= 500) {
         return "server error HTTP {$status}";
     }
@@ -727,7 +1119,7 @@ function printSummary(array $operations, array $phaseResults, array $state): voi
     $skipped = array_sum(array_column($phaseResults, 'skipped'));
     echo "=================================== SUMMARY ====================================\n";
     echo "API Operations:\n";
-    echo "  Selected: " . count($operations) . '/' . count($operations) . "\n";
+    echo "  Selected: " . count($operations) . '/' . ($state['total_operations'] ?? count($operations)) . "\n";
     echo "  Tested cases: {$state['cases']}\n\n";
     echo "Test Phases:\n";
     foreach ($phaseResults as $phase => $result) {
